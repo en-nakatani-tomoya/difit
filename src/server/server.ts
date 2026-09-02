@@ -9,7 +9,7 @@ import open from 'open';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { type DiffMode } from '../types/watch.js';
+import { DiffMode } from '../types/watch.js';
 import { formatCommentsOutput } from '../utils/commentFormatting.js';
 import {
   mergeCommentImports,
@@ -24,6 +24,13 @@ import {
   resolveEditorOption,
 } from '../utils/editorOptions.js';
 import { getFileExtension } from '../utils/fileUtils.js';
+import { determineDiffMode } from '../utils/watchMode.js';
+import {
+  createDiffEntryId,
+  deriveDiffTitle,
+  isValidDiffEntryId,
+  normalizeDiffTitle,
+} from '../utils/diffEntries.js';
 
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
@@ -35,8 +42,10 @@ import {
   type Comment,
   type CommentThread,
   type DiffCommentThread,
+  type DiffEntrySummary,
   type DiffResponse,
   type DiffSelection,
+  type DiffsResponse,
   type GeneratedStatusResponse,
   type RevisionsResponse,
 } from '@/types/diff.js';
@@ -59,6 +68,7 @@ interface ServerOptions {
   diffMode?: DiffMode;
   repoPath?: string;
   contextLines?: number;
+  title?: string;
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -103,6 +113,25 @@ interface CommentSessionState {
   version: number;
 }
 
+/**
+ * One reviewable diff hosted by the server. A single server can hold several of
+ * them; each is addressable under `/api/d/:diffId/...` (or `?diffId=`) and keeps
+ * its own comment sessions.
+ */
+interface DiffEntryState {
+  id: string;
+  title: string;
+  createdAt: string;
+  /** Selection currently displayed for this entry; updated by `/api/diff`. */
+  selection: DiffSelection;
+  commentSelection: DiffSelection;
+  initialSelection: DiffSelection;
+  stdinDiff?: string;
+  stdinDiffData?: DiffResponse;
+  commentImports: CommentImport[];
+  commentImportId?: string;
+}
+
 function createResolvedCommentSelection(
   responseDiffData: DiffResponse,
   fallbackSelection: DiffSelection,
@@ -117,8 +146,8 @@ function createResolvedCommentSelection(
   return createDiffSelection(baseCommitish, targetCommitish, baseMode);
 }
 
-function createCommentSessionKey(selection: DiffSelection): string {
-  return getDiffSelectionKey(selection);
+function createCommentSessionKey(diffId: string, selection: DiffSelection): string {
+  return `${diffId}\u0000${getDiffSelectionKey(selection)}`;
 }
 
 export async function startServer(
@@ -192,13 +221,121 @@ export async function startServer(
     parser.clearResolvedCommitCache();
   };
 
-  // Track current revisions for cache invalidation
-  let currentSelection = initialSelection;
-  let currentCommentSelection = createResolvedCommentSelection(
-    initialDiffData,
-    initialSelection,
-    Boolean(options.stdinDiff),
-  );
+  const diffEntries = new Map<string, DiffEntryState>();
+  let activeDiffId = '';
+
+  function uniqueDiffEntryId(): string {
+    let id = createDiffEntryId();
+    while (diffEntries.has(id)) {
+      id = createDiffEntryId();
+    }
+    return id;
+  }
+
+  function createDiffEntry(input: {
+    selection: DiffSelection;
+    diffData: DiffResponse;
+    title?: string;
+    stdinDiff?: string;
+    commentImports?: CommentImport[];
+    commentImportId?: string;
+  }): DiffEntryState {
+    const id = uniqueDiffEntryId();
+    const entry: DiffEntryState = {
+      id,
+      title:
+        normalizeDiffTitle(input.title) ??
+        deriveDiffTitle(input.selection, { stdin: Boolean(input.stdinDiff) }),
+      createdAt: new Date().toISOString(),
+      selection: input.selection,
+      commentSelection: createResolvedCommentSelection(
+        input.diffData,
+        input.selection,
+        Boolean(input.stdinDiff),
+      ),
+      initialSelection: input.selection,
+      stdinDiff: input.stdinDiff,
+      stdinDiffData: input.stdinDiff ? input.diffData : undefined,
+      commentImports: input.commentImports ?? [],
+      commentImportId: input.commentImportId,
+    };
+    diffEntries.set(id, entry);
+    activeDiffId = id;
+    return entry;
+  }
+
+  function toDiffEntrySummary(entry: DiffEntryState): DiffEntrySummary {
+    return {
+      id: entry.id,
+      title: entry.title,
+      createdAt: entry.createdAt,
+      selection: entry.selection,
+      isStdin: Boolean(entry.stdinDiff),
+      url: `/d/${entry.id}`,
+    };
+  }
+
+  const initialEntry = createDiffEntry({
+    selection: initialSelection,
+    diffData: initialDiffData,
+    title: options.title,
+    stdinDiff: options.stdinDiff,
+    commentImports: initialCommentImports,
+    commentImportId,
+  });
+
+  const DIFF_SCOPE_KEY = '__difitDiffEntry';
+  type ScopedRequest = express.Request & { [DIFF_SCOPE_KEY]?: DiffEntryState };
+
+  // Namespaced routes: `/api/d/:diffId/<rest>` is rewritten onto the flat `/api/<rest>`
+  // handlers with the resolved diff attached to the request.
+  app.use((req, res, next) => {
+    const [pathname, query] = req.url.split('?');
+    const match = /^\/api\/d\/([^/]+)(\/.*)?$/.exec(pathname ?? '');
+    if (!match) {
+      next();
+      return;
+    }
+
+    const entry = isValidDiffEntryId(match[1]) ? diffEntries.get(match[1]) : undefined;
+    if (!entry) {
+      res.status(404).json({ error: `Unknown diff id: ${match[1]}` });
+      return;
+    }
+
+    (req as ScopedRequest)[DIFF_SCOPE_KEY] = entry;
+    req.url = `/api${match[2] ?? '/'}${query === undefined ? '' : `?${query}`}`;
+    next();
+  });
+
+  // Flat `/api/...` routes accept `?diffId=` as an equivalent scope selector.
+  app.use('/api', (req, res, next) => {
+    const scoped = (req as ScopedRequest)[DIFF_SCOPE_KEY];
+    if (scoped) {
+      next();
+      return;
+    }
+
+    const requestedId = req.query.diffId;
+    if (requestedId === undefined) {
+      next();
+      return;
+    }
+
+    const entry = typeof requestedId === 'string' ? diffEntries.get(requestedId) : undefined;
+    if (!entry) {
+      res.status(404).json({ error: `Unknown diff id: ${String(requestedId)}` });
+      return;
+    }
+
+    (req as ScopedRequest)[DIFF_SCOPE_KEY] = entry;
+    next();
+  });
+
+  /** Resolves the diff a request targets, defaulting to the most recently added one. */
+  function resolveDiffEntry(req: express.Request): DiffEntryState {
+    return (req as ScopedRequest)[DIFF_SCOPE_KEY] ?? diffEntries.get(activeDiffId) ?? initialEntry;
+  }
 
   function parseRepositoryRelativePath(filepath: unknown):
     | { ok: true; path: string }
@@ -249,34 +386,40 @@ export async function startServer(
   const commentSessions = new Map<string, CommentSessionState>();
   const initialCommentThreads = mergeCommentImports([], initialCommentImports).threads;
   if (initialCommentThreads.length > 0) {
-    commentSessions.set(createCommentSessionKey(currentCommentSelection), {
+    commentSessions.set(createCommentSessionKey(initialEntry.id, initialEntry.commentSelection), {
       threads: initialCommentThreads,
       version: 1,
     });
   }
 
-  function getCommentSelectionFromQuery(query: Record<string, unknown>): DiffSelection {
+  function getCommentSelectionFromQuery(
+    entry: DiffEntryState,
+    query: Record<string, unknown>,
+  ): DiffSelection {
     const hasBase = typeof query.base === 'string';
     const hasTarget = typeof query.target === 'string';
     const hasBaseMode = typeof query.baseMode === 'string';
 
     if (!hasBase && !hasTarget && !hasBaseMode) {
-      return currentCommentSelection;
+      return entry.commentSelection;
     }
 
     return createDiffSelection(
-      hasBase ? (query.base as string) : currentCommentSelection.baseCommitish,
-      hasTarget ? (query.target as string) : currentCommentSelection.targetCommitish,
+      hasBase ? (query.base as string) : entry.commentSelection.baseCommitish,
+      hasTarget ? (query.target as string) : entry.commentSelection.targetCommitish,
       hasBaseMode
         ? parseBaseMode(query.baseMode)
         : hasBase || hasTarget
           ? undefined
-          : currentCommentSelection.baseMode,
+          : entry.commentSelection.baseMode,
     );
   }
 
-  function getOrCreateCommentSession(selection: DiffSelection): CommentSessionState {
-    const key = createCommentSessionKey(selection);
+  function getOrCreateCommentSession(
+    entry: DiffEntryState,
+    selection: DiffSelection,
+  ): CommentSessionState {
+    const key = createCommentSessionKey(entry.id, selection);
     const existing = commentSessions.get(key);
     if (existing) {
       return existing;
@@ -290,26 +433,124 @@ export async function startServer(
     return nextSession;
   }
 
+  let watchMode: DiffMode | undefined;
+
+  /**
+   * Diffs added after startup may need broader watching than the server booted
+   * with; widen to DOT (the superset) rather than juggling per-diff watchers.
+   */
+  async function ensureWatchCoverage(mode: DiffMode): Promise<void> {
+    if (mode === DiffMode.SPECIFIC || watchMode === mode || watchMode === DiffMode.DOT) {
+      return;
+    }
+
+    const nextMode = watchMode === undefined ? mode : DiffMode.DOT;
+    try {
+      await fileWatcher.start(nextMode, repositoryPath, 300, invalidateCache);
+      watchMode = nextMode;
+    } catch (error) {
+      console.warn('⚠️  File watcher failed to start:', error);
+    }
+  }
+
+  function resolveAddedBaseCommitish(target: string, base: unknown): string {
+    if (typeof base === 'string' && base.length > 0) {
+      return base;
+    }
+
+    if (target === 'working') {
+      return 'staged';
+    }
+
+    if (target === 'staged' || target === '.') {
+      return 'HEAD';
+    }
+
+    return `${target}^`;
+  }
+
+  app.get('/api/diffs', (_req, res) => {
+    const response: DiffsResponse = {
+      diffs: [...diffEntries.values()].map(toDiffEntrySummary),
+      activeDiffId,
+    };
+    res.json(response);
+  });
+
+  // Register an additional diff on this running server.
+  app.post('/api/diffs', async (req, res) => {
+    const body: unknown = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    const payload = (body ?? {}) as {
+      target?: unknown;
+      base?: unknown;
+      baseMode?: unknown;
+      title?: unknown;
+    };
+
+    if (typeof payload.target !== 'string' || payload.target.trim().length === 0) {
+      res.status(400).json({ error: 'target is required' });
+      return;
+    }
+
+    const target = payload.target.trim();
+    const selection = createDiffSelection(
+      resolveAddedBaseCommitish(target, payload.base),
+      target,
+      parseBaseMode(payload.baseMode),
+    );
+
+    try {
+      if (!(await parser.validateCommit(target))) {
+        res.status(400).json({ error: `Invalid or non-existent commit: ${target}` });
+        return;
+      }
+
+      const diffData = await parser.parseDiff(selection, false, options.contextLines);
+      setCachedDiffResponse(diffDataCache, createDiffCacheKey(selection, false), diffData);
+
+      const entry = createDiffEntry({
+        selection,
+        diffData,
+        title: typeof payload.title === 'string' ? payload.title : undefined,
+      });
+
+      await ensureWatchCoverage(
+        determineDiffMode(selection, typeof payload.base === 'string' && payload.base.length > 0),
+      );
+
+      res.status(201).json({
+        ...toDiffEntrySummary(entry),
+        isEmpty: diffData.isEmpty ?? false,
+      });
+    } catch (error) {
+      console.error('Error adding diff:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to add diff',
+      });
+    }
+  });
+
   app.get('/api/diff', async (req, res) => {
+    const entry = resolveDiffEntry(req);
     const ignoreWhitespace = req.query.ignoreWhitespace === 'true';
     const hasBase = typeof req.query.base === 'string';
     const hasTarget = typeof req.query.target === 'string';
     const hasBaseMode = typeof req.query.baseMode === 'string';
     const requestedSelection = createDiffSelection(
-      hasBase ? (req.query.base as string) : currentSelection.baseCommitish,
-      hasTarget ? (req.query.target as string) : currentSelection.targetCommitish,
+      hasBase ? (req.query.base as string) : entry.selection.baseCommitish,
+      hasTarget ? (req.query.target as string) : entry.selection.targetCommitish,
       hasBaseMode
         ? parseBaseMode(req.query.baseMode)
         : hasBase || hasTarget
           ? undefined
-          : currentSelection.baseMode,
+          : entry.selection.baseMode,
     );
     const shouldIncludeCommentImports =
-      initialCommentImports.length > 0 &&
-      (Boolean(options.stdinDiff) || diffSelectionsEqual(requestedSelection, initialSelection));
+      entry.commentImports.length > 0 &&
+      (Boolean(entry.stdinDiff) || diffSelectionsEqual(requestedSelection, entry.initialSelection));
 
-    let responseDiffData = initialDiffData;
-    if (!options.stdinDiff) {
+    let responseDiffData = entry.stdinDiffData ?? initialDiffData;
+    if (!entry.stdinDiff) {
       const cacheKey = createDiffCacheKey(requestedSelection, ignoreWhitespace);
       const cached = getCachedDiffResponse(diffDataCache, cacheKey);
       if (cached) {
@@ -333,30 +574,30 @@ export async function startServer(
       }
     }
 
-    currentSelection = requestedSelection;
+    entry.selection = requestedSelection;
 
-    currentCommentSelection = createResolvedCommentSelection(
+    entry.commentSelection = createResolvedCommentSelection(
       responseDiffData,
       requestedSelection,
-      Boolean(options.stdinDiff),
+      Boolean(entry.stdinDiff),
     );
 
-    const baseCommitish =
-      responseDiffData.baseCommitish ?? (options.stdinDiff ? 'stdin' : undefined);
+    const baseCommitish = responseDiffData.baseCommitish ?? (entry.stdinDiff ? 'stdin' : undefined);
     const targetCommitish =
-      responseDiffData.targetCommitish ?? (options.stdinDiff ? 'stdin' : undefined);
+      responseDiffData.targetCommitish ?? (entry.stdinDiff ? 'stdin' : undefined);
     const requestedBaseCommitish =
       responseDiffData.requestedBaseCommitish ??
-      (requestedSelection.baseCommitish || (options.stdinDiff ? 'stdin' : undefined));
+      (requestedSelection.baseCommitish || (entry.stdinDiff ? 'stdin' : undefined));
     const requestedTargetCommitish =
       responseDiffData.requestedTargetCommitish ??
-      (requestedSelection.targetCommitish || (options.stdinDiff ? 'stdin' : undefined));
+      (requestedSelection.targetCommitish || (entry.stdinDiff ? 'stdin' : undefined));
     const requestedBaseMode = responseDiffData.requestedBaseMode ?? requestedSelection.baseMode;
 
     res.json({
       ...responseDiffData,
+      diffId: entry.id,
       ignoreWhitespace,
-      openInEditorAvailable: !options.stdinDiff,
+      openInEditorAvailable: !entry.stdinDiff,
       baseCommitish,
       targetCommitish,
       requestedBaseCommitish,
@@ -364,13 +605,14 @@ export async function startServer(
       requestedBaseMode,
       clearComments: options.clearComments,
       repositoryId,
-      commentImports: shouldIncludeCommentImports ? initialCommentImports : undefined,
-      commentImportId: shouldIncludeCommentImports ? commentImportId : undefined,
+      commentImports: shouldIncludeCommentImports ? entry.commentImports : undefined,
+      commentImportId: shouldIncludeCommentImports ? entry.commentImportId : undefined,
     });
   });
 
   app.get(/^\/api\/generated-status\/(.*)$/, async (req, res) => {
-    if (options.stdinDiff) {
+    const entry = resolveDiffEntry(req);
+    if (entry.stdinDiff) {
       res.status(400).json({ error: 'Generated status is not available for stdin diff' });
       return;
     }
@@ -383,7 +625,7 @@ export async function startServer(
       }
       const normalizedFilepath = filepathResult.path;
 
-      const ref = (req.query.ref as string) || currentSelection.targetCommitish || 'HEAD';
+      const ref = (req.query.ref as string) || entry.selection.targetCommitish || 'HEAD';
       const cacheKey = `${ref}:${normalizedFilepath}`;
       const now = Date.now();
       const cached = generatedStatusCache.get(cacheKey);
@@ -411,8 +653,9 @@ export async function startServer(
   });
 
   // Get available revisions for revision selector
-  app.get('/api/revisions', async (_req, res) => {
-    if (options.stdinDiff) {
+  app.get('/api/revisions', async (req, res) => {
+    const entry = resolveDiffEntry(req);
+    if (entry.stdinDiff) {
       res.status(400).json({ error: 'Revision selection not available for stdin diff' });
       return;
     }
@@ -420,8 +663,8 @@ export async function startServer(
     try {
       const { branches, commits, originDefaultBranch, resolvedBase, resolvedTarget } =
         await parser.getRevisionOptions(
-          currentSelection.baseCommitish,
-          currentSelection.targetCommitish,
+          entry.selection.baseCommitish,
+          entry.selection.targetCommitish,
         );
 
       const response: RevisionsResponse = {
@@ -446,7 +689,7 @@ export async function startServer(
 
   app.get(/^\/api\/line-count\/(.*)$/, async (req, res) => {
     try {
-      if (options.stdinDiff) {
+      if (resolveDiffEntry(req).stdinDiff) {
         res.status(404).json({ error: 'Line count not available for stdin diff' });
         return;
       }
@@ -495,7 +738,7 @@ export async function startServer(
   app.get(/^\/api\/blob\/(.*)$/, async (req, res) => {
     try {
       // If using stdin diff, blob content is not available
-      if (options.stdinDiff) {
+      if (resolveDiffEntry(req).stdinDiff) {
         res.status(404).json({ error: 'Blob content not available for stdin diff' });
         return;
       }
@@ -710,10 +953,11 @@ export async function startServer(
   }
 
   function updateCommentSession(
+    entry: DiffEntryState,
     selection: DiffSelection,
     nextThreads: DiffCommentThread[],
   ): boolean {
-    const session = getOrCreateCommentSession(selection);
+    const session = getOrCreateCommentSession(entry, selection);
     const previous = JSON.stringify(session.threads);
     const next = JSON.stringify(nextThreads);
     session.threads = nextThreads;
@@ -733,12 +977,13 @@ export async function startServer(
 
   app.post('/api/comments', (req, res) => {
     try {
-      const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
+      const entry = resolveDiffEntry(req);
+      const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
       const body: unknown =
         typeof req.body === 'string' ? (JSON.parse(req.body) as unknown) : req.body;
       const nextThreads = parseCommentsPayload(body);
       const baseVersion = parseBaseVersion(body);
-      const session = getOrCreateCommentSession(selection);
+      const session = getOrCreateCommentSession(entry, selection);
 
       // Stale baseVersion means another writer (e.g. an agent) changed comments since the
       // client's last read, so merge rather than overwrite. A matching/absent version replaces.
@@ -747,7 +992,7 @@ export async function startServer(
         ? mergeCommentThreads(session.threads, nextThreads).threads
         : nextThreads;
 
-      updateCommentSession(selection, resolvedThreads);
+      updateCommentSession(entry, selection, resolvedThreads);
 
       res.json({
         success: true,
@@ -763,14 +1008,15 @@ export async function startServer(
 
   app.post('/api/comment-imports', (req, res) => {
     try {
-      const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
-      const session = getOrCreateCommentSession(selection);
+      const entry = resolveDiffEntry(req);
+      const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
+      const session = getOrCreateCommentSession(entry, selection);
       const commentImports = parseCommentImportsPayload(req.body);
       const importId = createHash('sha256')
         .update(serializeCommentImports(commentImports))
         .digest('hex');
       const merged = mergeCommentImports(session.threads, commentImports);
-      const changed = updateCommentSession(selection, merged.threads);
+      const changed = updateCommentSession(entry, selection, merged.threads);
 
       res.json({
         success: true,
@@ -786,8 +1032,9 @@ export async function startServer(
   });
 
   app.delete('/api/comments/:threadId', (req, res) => {
-    const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
-    const session = getOrCreateCommentSession(selection);
+    const entry = resolveDiffEntry(req);
+    const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
+    const session = getOrCreateCommentSession(entry, selection);
     const threadId = req.params.threadId;
     const nextThreads = session.threads.filter((thread) => thread.id !== threadId);
 
@@ -796,7 +1043,7 @@ export async function startServer(
       return;
     }
 
-    updateCommentSession(selection, nextThreads);
+    updateCommentSession(entry, selection, nextThreads);
 
     res.json({
       success: true,
@@ -806,22 +1053,39 @@ export async function startServer(
   });
 
   app.get('/api/comments-json', (req, res) => {
-    const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
-    const session = getOrCreateCommentSession(selection);
+    const entry = resolveDiffEntry(req);
+    const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
+    const session = getOrCreateCommentSession(entry, selection);
     res.json({
       version: session.version,
       threads: session.threads,
     });
   });
 
+  /**
+   * Text output for humans and for the CLI's shutdown dump. An unscoped request on a
+   * server hosting several diffs reports all of them, each under its own heading.
+   */
   app.get('/api/comments-output', (req, res) => {
-    const selection = getCommentSelectionFromQuery(req.query as Record<string, unknown>);
-    const session = getOrCreateCommentSession(selection);
     res.type('text/plain');
 
+    const isScoped =
+      (req as ScopedRequest)[DIFF_SCOPE_KEY] !== undefined ||
+      typeof req.query.base === 'string' ||
+      typeof req.query.target === 'string' ||
+      typeof req.query.baseMode === 'string';
+
+    if (!isScoped) {
+      res.send(buildAllCommentsOutput());
+      return;
+    }
+
+    const entry = resolveDiffEntry(req);
+    const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
+    const session = getOrCreateCommentSession(entry, selection);
+
     if (session.threads.length > 0) {
-      const output = formatCommentsOutput(session.threads.map(toCommentThread));
-      res.send(output);
+      res.send(formatCommentsOutput(session.threads.map(toCommentThread)));
     } else {
       res.send('');
     }
@@ -856,7 +1120,7 @@ export async function startServer(
   });
 
   app.post('/api/open-in-editor', async (req, res) => {
-    if (options.stdinDiff) {
+    if (resolveDiffEntry(req).stdinDiff) {
       res.status(400).json({ error: 'Open in editor is not available for stdin diff' });
       return;
     }
@@ -958,10 +1222,28 @@ export async function startServer(
   });
 
   // Function to output comments when server shuts down
+  /** Comments of every hosted diff, labelled per diff once more than one exists. */
+  function buildAllCommentsOutput(): string {
+    const entries = [...diffEntries.values()];
+    const sections: string[] = [];
+
+    for (const entry of entries) {
+      const session = getOrCreateCommentSession(entry, entry.commentSelection);
+      if (session.threads.length === 0) {
+        continue;
+      }
+
+      const output = formatCommentsOutput(session.threads.map(toCommentThread));
+      sections.push(entries.length > 1 ? `# ${entry.title}  (${entry.id})\n${output}` : output);
+    }
+
+    return sections.join('\n');
+  }
+
   function outputFinalComments() {
-    const session = getOrCreateCommentSession(currentCommentSelection);
-    if (session.threads.length > 0) {
-      console.log(formatCommentsOutput(session.threads.map(toCommentThread)));
+    const output = buildAllCommentsOutput();
+    if (output) {
+      console.log(output);
     }
   }
 
@@ -1027,6 +1309,10 @@ export async function startServer(
     // Find client files relative to the CLI executable location
     const distPath = join(__dirname, '..', 'client');
     app.use(express.static(distPath));
+    // `/d/:diffId` is a client-side route; serve the SPA shell for it.
+    app.get(/^\/d\/[^/]+\/?$/, (_req, res) => {
+      res.sendFile(join(distPath, 'index.html'));
+    });
   } else {
     app.get('/', (_req, res) => {
       res.send(`
@@ -1064,6 +1350,7 @@ export async function startServer(
   if (options.diffMode) {
     try {
       await fileWatcher.start(options.diffMode, repositoryPath, 300, invalidateCache);
+      watchMode = options.diffMode;
     } catch (error) {
       console.warn('⚠️  File watcher failed to start:', error);
       console.warn('   Continuing without file watching...');

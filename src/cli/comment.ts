@@ -2,6 +2,7 @@ import { Command, Option } from 'commander';
 
 import { parseCommentImportValue } from '../utils/commentImports.js';
 
+import { apiBaseUrl, handleCommandError } from './serverRequest.js';
 import { detectStdinSource, readStdin } from './utils.js';
 
 interface CommentImportResponse {
@@ -9,15 +10,6 @@ interface CommentImportResponse {
   importId?: string;
   count?: number;
   warnings?: string[];
-}
-
-function handleCommandError(error: unknown, port: number): never {
-  if (error instanceof TypeError && error.message.includes('fetch failed')) {
-    console.error(`Error: Cannot connect to difit server on port ${port}. Is the server running?`);
-  } else {
-    console.error(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
-  process.exit(1);
 }
 
 async function parseCommentAddInput(json?: string): Promise<string> {
@@ -47,12 +39,13 @@ export function createCommentCommand(): Command {
     .description('Add comments to a running difit server')
     .argument('[json]', 'comment import JSON (object or array)')
     .requiredOption('--port <port>', 'port of the running difit server', parseInt)
-    .action(async (json: string | undefined, opts: { port: number }) => {
+    .option('--diff <id>', 'target a specific diff on the server (see `difit diff list`)')
+    .action(async (json: string | undefined, opts: { port: number; diff?: string }) => {
       try {
         const input = await parseCommentAddInput(json);
         const imports = parseCommentImportValue(input);
 
-        const response = await fetch(`http://localhost:${opts.port}/api/comment-imports`, {
+        const response = await fetch(`${apiBaseUrl(opts.port, opts.diff)}/comment-imports`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(imports),
@@ -84,13 +77,14 @@ export function createCommentCommand(): Command {
     .command('get')
     .description('Retrieve comments from a running difit server')
     .requiredOption('--port <port>', 'port of the running difit server', parseInt)
+    .option('--diff <id>', 'target a specific diff on the server (see `difit diff list`)')
     .addOption(
       new Option('--format <format>', 'output format').choices(['text', 'json']).default('text'),
     )
-    .action(async (opts: { port: number; format: string }) => {
+    .action(async (opts: { port: number; format: string; diff?: string }) => {
       try {
-        const endpoint = opts.format === 'json' ? '/api/comments-json' : '/api/comments-output';
-        const response = await fetch(`http://localhost:${opts.port}${endpoint}`);
+        const endpoint = opts.format === 'json' ? '/comments-json' : '/comments-output';
+        const response = await fetch(`${apiBaseUrl(opts.port, opts.diff)}${endpoint}`);
 
         if (!response.ok) {
           console.error('Error: Failed to retrieve comments');
@@ -117,7 +111,8 @@ export function createCommentCommand(): Command {
     .description('Resolve (remove) comment threads on a running difit server')
     .argument('<threadIds...>', 'thread IDs to resolve')
     .requiredOption('--port <port>', 'port of the running difit server', parseInt)
-    .action(async (threadIds: string[], opts: { port: number }) => {
+    .option('--diff <id>', 'target a specific diff on the server (see `difit diff list`)')
+    .action(async (threadIds: string[], opts: { port: number; diff?: string }) => {
       try {
         const results = await Promise.all(
           threadIds.map(
@@ -129,7 +124,7 @@ export function createCommentCommand(): Command {
               error?: string;
             }> => {
               const response = await fetch(
-                `http://localhost:${opts.port}/api/comments/${encodeURIComponent(threadId)}`,
+                `${apiBaseUrl(opts.port, opts.diff)}/comments/${encodeURIComponent(threadId)}`,
                 { method: 'DELETE' },
               );
 
