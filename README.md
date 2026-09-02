@@ -156,6 +156,39 @@ Stdin mode is selected with intent-first rules:
 | `--keep-alive`        | false           | Keep server running after browser disconnects (stop manually with Ctrl+C)                               |
 | `--background`        | false           | Keep the server running in the background and output JSON connection info                               |
 | `--context <lines>`   | git default (3) | Limit surrounding context lines per change (`0` shows changes only; not available with `--pr` or stdin) |
+| `--title <title>`     | derived         | Title shown for this diff in the diff switcher                                                          |
+
+## 🗂️ Multiple Diffs on One Server
+
+One server can host several independent diffs. Each is served under its own namespace
+(`/d/<diffId>` in the browser, `/api/d/<diffId>/...` for the API) and keeps its own
+review comments.
+
+```sh
+difit HEAD --keep-alive --title "HEAD commit"          # start the server
+difit diff add main feature --port 4966 --title "PR #123"   # add another diff
+difit diff list --port 4966                            # id, elapsed hours, title, range
+```
+
+`difit diff list` output (`*` marks the diff that unscoped API calls target):
+
+```sh
+  tpb4t5ud    0h  HEAD commit  (HEAD^ → HEAD)
+* yoqzhlmk    3h  PR #123  (feature → main)
+```
+
+When the server hosts more than one diff, a switcher appears at the bottom of the page:
+each tab shows the diff's title and how many hours ago it was added, capped at `99h` and
+then displayed as `99+`. Clicking a tab switches to that diff.
+
+Comment commands take an optional `--diff <id>` to target one specific diff:
+
+```sh
+difit comment get --port 4966 --diff yoqzhlmk
+```
+
+Without `--diff`, `comment add` / `comment resolve` target the most recently added diff,
+and `comment get` reports the comments of every hosted diff.
 
 ## 💬 Comment System
 

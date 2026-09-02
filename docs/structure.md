@@ -45,12 +45,24 @@ difit [commit-ish] [compare-with]
 
 ### Options
 
-| Option          | Description                                | Default   |
-| --------------- | ------------------------------------------ | --------- |
-| `--port <port>` | Preferred port (auto-assigned if occupied) | 4966      |
-| `--host <host>` | Host address to bind                       | 127.0.0.1 |
-| `--no-open`     | Do not automatically open browser          | false     |
-| `--pr <url>`    | Review GitHub PR by URL                    | -         |
+| Option            | Description                                | Default   |
+| ----------------- | ------------------------------------------ | --------- |
+| `--port <port>`   | Preferred port (auto-assigned if occupied) | 4966      |
+| `--host <host>`   | Host address to bind                       | 127.0.0.1 |
+| `--no-open`       | Do not automatically open browser          | false     |
+| `--pr <url>`      | Review GitHub PR by URL                    | -         |
+| `--title <title>` | Title shown in the diff switcher           | derived   |
+
+### Subcommands
+
+| Command                                  | Description                                 |
+| ---------------------------------------- | ------------------------------------------- |
+| `difit diff add <target> [compare-with]` | Register another diff on a running server   |
+| `difit diff list`                        | List the diffs a running server hosts       |
+| `difit comment add\|get\|resolve`        | Read and write comments on a running server |
+
+All subcommands require `--port <port>`; the `comment` subcommands accept `--diff <id>`
+to target a specific diff.
 
 ### Special Arguments Behavior
 
@@ -111,10 +123,25 @@ difit [commit-ish] [compare-with]
 
 | Endpoint               | Method | Description                                        |
 | ---------------------- | ------ | -------------------------------------------------- |
+| `/api/diffs`           | GET    | List the diffs hosted by the server                |
+| `/api/diffs`           | POST   | Register an additional diff                        |
 | `/api/diff`            | GET    | Retrieve diff data with optional whitespace ignore |
 | `/api/comments`        | POST   | Save review comments                               |
 | `/api/comments-output` | GET    | Get formatted comments output                      |
 | `/api/heartbeat`       | GET    | SSE endpoint for tab close detection               |
+
+### Diff Namespacing
+
+A server can host several independent diffs of the same repository:
+
+- Each diff has a short id, a title, and a `createdAt` timestamp (`DiffEntrySummary`).
+- `/api/d/:diffId/<rest>` is rewritten onto the flat `/api/<rest>` handlers with that diff
+  attached to the request; `/api/<rest>?diffId=<id>` is equivalent. An unknown id yields 404.
+- Unscoped requests fall back to the most recently added diff. `/api/comments-output` is the
+  exception: unscoped, it reports every diff.
+- Comment sessions are keyed by diff id **and** revision selection, so diffs never share comments.
+- The browser page for a diff is `/d/:diffId`; the client pins itself to the diff id returned
+  by `/api/diff` and rewrites its address bar to match.
 
 ### Request Flow
 

@@ -23,6 +23,7 @@ import {
 import { Checkbox } from './components/Checkbox';
 import { CommentsDropdown } from './components/CommentsDropdown';
 import { CommentsListModal } from './components/CommentsListModal';
+import { DiffTabBar } from './components/DiffTabBar';
 import { DiffQuickMenu } from './components/DiffQuickMenu';
 import { DiffViewer } from './components/DiffViewer';
 import { FileList } from './components/FileList';
@@ -36,6 +37,7 @@ import { SparkleAnimation } from './components/SparkleAnimation';
 import { WordHighlightProvider } from './contexts/WordHighlightContext';
 import { useAppearanceSettings } from './hooks/useAppearanceSettings';
 import { useDiffComments } from './hooks/useDiffComments';
+import { useDiffEntries } from './hooks/useDiffEntries';
 import { useExpandedLines, type MergedChunk } from './hooks/useExpandedLines';
 import { useFileWatch } from './hooks/useFileWatch';
 import { useKeyboardNavigation } from './hooks/useKeyboardNavigation';
@@ -45,6 +47,7 @@ import { useViewport } from './hooks/useViewport';
 import { fetchClientSettings, saveClientSettings } from './services/userSettings';
 import { hasMultipleCommentAuthors } from './utils/commentAuthors';
 import { copyTextToClipboard } from './utils/clipboard';
+import { apiUrl, getScopedDiffId, setScopedDiffId } from './utils/diffScope';
 import { getFileElementId } from './utils/domUtils';
 import { findCommentPosition } from './utils/navigation/positionHelpers';
 import { resolveEventSourceUrl } from './utils/eventSourceUrl';
@@ -204,6 +207,9 @@ function App() {
     resolvedSelection?.baseMode,
   );
 
+  const { diffs: hostedDiffs, now: diffsNow } = useDiffEntries();
+  const currentDiffId = diffData?.diffId ?? getScopedDiffId();
+  const showDiffTabBar = hostedDiffs.length > 1;
   const showMobileCommentsBar = isMobile && threads.length > 0;
   const commentsContextKey = useMemo(() => {
     if (!resolvedSelectionKey) {
@@ -230,9 +236,9 @@ function App() {
   const getCommentApiUrl = useCallback(
     (path: string) => {
       if (!commentSessionQueryString) {
-        return path;
+        return apiUrl(path);
       }
-      return `${path}?${commentSessionQueryString}`;
+      return apiUrl(`${path}?${commentSessionQueryString}`);
     },
     [commentSessionQueryString],
   );
@@ -707,7 +713,7 @@ function App() {
         if (requestedSelection?.baseMode === 'merge-base')
           params.set('baseMode', requestedSelection.baseMode);
 
-        const response = await fetch(`/api/diff?${params}`, {
+        const response = await fetch(apiUrl(`/api/diff?${params}`), {
           signal: controller.signal,
         });
         if (!response.ok) throw new Error('Failed to fetch diff data');
@@ -715,6 +721,9 @@ function App() {
         if (diffRequestIdRef.current !== requestId) {
           return;
         }
+        // Pin this page to the diff the server answered with, so later requests and
+        // reloads keep hitting it even if the server's active diff changes.
+        setScopedDiffId(data.diffId ?? null);
         setDiffData(data);
         setDiffDataVersion((prev) => prev + 1);
 
@@ -854,7 +863,7 @@ function App() {
 
   // Fetch revision options on mount
   useEffect(() => {
-    fetch('/api/revisions')
+    fetch(apiUrl('/api/revisions'))
       .then((res) => (res.ok ? res.json() : null))
       .then((data: RevisionsResponse | null) => {
         setRevisionOptions(data);
@@ -1108,7 +1117,7 @@ function App() {
   const handleOpenInEditor = useCallback(
     async (filePath: string, lineNumber: number) => {
       try {
-        const response = await fetch('/api/open-in-editor', {
+        const response = await fetch(apiUrl('/api/open-in-editor'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1563,7 +1572,10 @@ function App() {
         </div>
 
         {showMobileCommentsBar && (
-          <div className="fixed bottom-0 left-0 right-0 z-20 bg-github-bg-secondary border-t border-github-border px-4 py-2 flex justify-end">
+          <div
+            className="fixed left-0 right-0 z-20 bg-github-bg-secondary border-t border-github-border px-4 py-2 flex justify-end"
+            style={{ bottom: showDiffTabBar ? '2.5rem' : 0 }}
+          >
             <CommentsDropdown
               commentsCount={threads.length}
               isCopiedAll={isCopiedAll}
@@ -1574,6 +1586,10 @@ function App() {
               compact
             />
           </div>
+        )}
+
+        {showDiffTabBar && (
+          <DiffTabBar diffs={hostedDiffs} currentDiffId={currentDiffId} now={diffsNow} />
         )}
 
         {isSettingsOpen && (

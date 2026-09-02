@@ -7,7 +7,7 @@ import pkg from '../../package.json' with { type: 'json' };
 import { startServer } from '../server/server.js';
 import { type CommentImport, type DiffSelection } from '../types/diff.js';
 import { createDiffSelection } from '../utils/diffSelection.js';
-import { DiffMode } from '../types/watch.js';
+import { determineDiffMode } from '../utils/watchMode.js';
 
 import {
   shouldReadStdin,
@@ -20,6 +20,7 @@ import {
   readStdin,
 } from './utils.js';
 import { createCommentCommand } from './comment.js';
+import { createDiffCommand } from './diff.js';
 import { getPrPatch, getPrCommentImports } from './github.js';
 import {
   BACKGROUND_CHILD_ENV,
@@ -54,30 +55,6 @@ function resolveDiffSelection(
   return createDiffSelection(baseCommitish, commitish, mergeBase ? 'merge-base' : undefined);
 }
 
-function determineDiffMode(selection: DiffSelection, compareWith?: string): DiffMode {
-  const { targetCommitish } = selection;
-
-  // If comparing specific commits/branches (not involving HEAD), no watching needed
-  // Exception: allow watching when targetCommitish is '.' even with compareWith
-  if (compareWith && targetCommitish !== 'HEAD' && targetCommitish !== '.') {
-    return DiffMode.SPECIFIC;
-  }
-
-  if (targetCommitish === 'working') {
-    return DiffMode.WORKING;
-  }
-
-  if (targetCommitish === 'staged') {
-    return DiffMode.STAGED;
-  }
-
-  if (targetCommitish === '.') {
-    return DiffMode.DOT;
-  }
-  // Default mode: HEAD^ vs HEAD or HEAD vs other commits (watch for HEAD changes)
-  return DiffMode.DEFAULT;
-}
-
 interface CliOptions {
   port?: number;
   host?: string;
@@ -90,6 +67,7 @@ interface CliOptions {
   background?: boolean;
   context?: number;
   mergeBase?: boolean;
+  title?: string;
 }
 
 const program = new Command();
@@ -100,6 +78,7 @@ program
   .version(pkg.version, '-v, --version', 'output the version number')
   .enablePositionalOptions()
   .addCommand(createCommentCommand())
+  .addCommand(createDiffCommand())
   .argument(
     '[commit-ish]',
     'Git commit, tag, branch, HEAD~n reference, or "working"/"staged"/"."',
@@ -124,6 +103,7 @@ program
   .option('--keep-alive', 'keep server running even after browser disconnects')
   .option('--background', 'keep the server running in the background and output JSON info')
   .option('--context <lines>', 'number of context lines shown around each change', parseInt)
+  .option('--title <title>', 'title shown in the diff switcher')
   .option(
     '--merge-base',
     'resolve the base revision with git merge-base before diffing (Git revision mode only)',
@@ -234,6 +214,7 @@ program
           openBrowser: options.open,
           clearComments: options.clean,
           keepAlive: options.keepAlive,
+          title: options.title ?? stdinReviewLabel,
           ...(commentImports.length > 0 ? { commentImports } : {}),
         });
 
@@ -295,8 +276,9 @@ program
         clearComments: options.clean,
         keepAlive: options.keepAlive,
         contextLines: options.context,
-        diffMode: determineDiffMode(selection, compareWith),
+        diffMode: determineDiffMode(selection, Boolean(compareWith)),
         repoPath,
+        title: options.title,
         ...(commentImports.length > 0 ? { commentImports } : {}),
       });
 

@@ -78,6 +78,20 @@ Keep at most one live difit server per Git root and review target. When you edit
   - `<difit-command> comment get --port <port>` — read the user's review comments (`--format json` for structured output).
   - `<difit-command> comment add --port <port> '<json>'` — add new comments to the running server (same JSON shape as `--comment`).
   - `<difit-command> comment resolve <threadId...> --port <port>` — resolve threads you have addressed.
+
+## Hosting Several Diffs on One Server
+
+If a second, unrelated diff needs reviewing while a server is alive, add it to that server
+instead of starting another one:
+
+```bash
+<difit-command> diff add <target> [compare-with] --port <port> --title '<short title>'
+```
+
+- Give every diff a short, descriptive `--title`; it labels the switcher at the bottom of the page.
+- `<difit-command> diff list --port <port>` prints each diff's id, how many hours ago it was added, and its range.
+- Comment commands take `--diff <id>` to target one specific diff; without it, `comment get` reports all of them.
+- Tell the user the returned URL so they can open that diff directly.
 - If the review target changes (for example, a different commit range), stop the existing server and start a new one rather than leaving two servers for the same repository.
 
 ## Constraints

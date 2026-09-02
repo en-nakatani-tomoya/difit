@@ -48,6 +48,7 @@ export interface DiffSelection {
 
 export interface DiffResponse {
   commit: string;
+  diffId?: string;
   files: DiffFile[];
   ignoreWhitespace?: boolean;
   isEmpty?: boolean;
@@ -61,6 +62,21 @@ export interface DiffResponse {
   repositoryId?: string;
   commentImports?: CommentImport[];
   commentImportId?: string;
+}
+
+export interface DiffEntrySummary {
+  id: string;
+  title: string;
+  /** ISO 8601 timestamp of when the diff was registered on the server. */
+  createdAt: string;
+  selection: DiffSelection;
+  isStdin: boolean;
+  url: string;
+}
+
+export interface DiffsResponse {
+  diffs: DiffEntrySummary[];
+  activeDiffId: string;
 }
 
 export interface GeneratedStatusResponse {
