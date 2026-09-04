@@ -176,6 +176,8 @@ src/components/Button.tsx:L42-L48   # この行が自動的に追加されます
 この部分は不要です
 ```
 
+エージェント向けには `difit comment get --port <port> --format agent` が使えます。1 スレッド 1 行の JSON Lines（`id` / `file` / `side` / `line` / `body` / `replies`）を出力します。
+
 ## 🤖 エージェントからの呼び出し
 
 AIエージェントから difit を使うための skill 群を以下でインストールできます。

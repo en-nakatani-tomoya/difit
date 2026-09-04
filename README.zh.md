@@ -176,6 +176,8 @@ src/components/Button.tsx:L42-L48   # 此行自动添加
 此部分是不必要的
 ```
 
+面向代理可以使用 `difit comment get --port <port> --format agent`，它以每个线程一行的 JSON Lines（`id` / `file` / `side` / `line` / `body` / `replies`）输出。
+
 ## 🤖 从代理调用
 
 你可以通过以下命令安装这些 Skill，以便从 AI 代理中使用 difit：
