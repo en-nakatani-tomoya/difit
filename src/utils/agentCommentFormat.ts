@@ -56,7 +56,9 @@ export function toAgentCommentLine(
     replies: rest.length,
   };
 
-  if (options.withReplies) {
+  // A thread with no replies gets no `messages` key at all, so agents can test the
+  // key's presence instead of an empty array.
+  if (options.withReplies && rest.length > 0) {
     result.messages = rest.map((message) => ({
       ...(message.author ? { author: message.author } : {}),
       body: message.body,

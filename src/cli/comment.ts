@@ -133,11 +133,17 @@ export function createCommentCommand(): Command {
     .requiredOption('--port <port>', 'port of the running difit server', parseInt)
     .option('--diff <id>', 'target a specific diff on the server (see `difit diff list`)')
     .addOption(
-      new Option('--format <format>', 'output format')
+      new Option(
+        '--format <format>',
+        'output format ("agent" prints JSON Lines, one thread per line; a line carrying `diffId` must be resolved with `comment resolve --diff <diffId>`)',
+      )
         .choices(['text', 'json', 'agent'])
         .default('text'),
     )
-    .option('--with-replies', 'agent format: include replies as `messages`')
+    .option(
+      '--with-replies',
+      'agent format: include replies as `messages` (omitted when there are none)',
+    )
     .option('--with-snapshot', 'agent format: include the code snapshot as `snippet`')
     .action(
       async (opts: {

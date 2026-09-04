@@ -176,7 +176,7 @@ src/components/Button.tsx:L42-L48   # 此行自动添加
 此部分是不必要的
 ```
 
-面向代理可以使用 `difit comment get --port <port> --format agent`，它以每个线程一行的 JSON Lines（`id` / `file` / `side` / `line` / `body` / `replies`）输出。
+面向代理可以使用 `difit comment get --port <port> --format agent`，它以每个线程一行的 JSON Lines（`id` / `file` / `side` / `line` / `body` / `replies`，在未指定范围地获取多个 diff 时还有 `diffId`）输出。`--with-replies` / `--with-snapshot` 可以附加回复正文和代码快照。带 `diffId` 的行需要按 `comment resolve --diff <diffId> <id>` 指定 diff 来解决。
 
 ## 🤖 从代理调用
 

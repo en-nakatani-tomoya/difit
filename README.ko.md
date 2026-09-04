@@ -176,7 +176,7 @@ src/components/Button.tsx:L42-L48   # 이 줄은 자동으로 추가됩니다
 이 부분은 불필요합니다
 ```
 
-에이전트용으로는 `difit comment get --port <port> --format agent` 를 사용할 수 있습니다. 스레드 하나당 한 줄의 JSON Lines(`id` / `file` / `side` / `line` / `body` / `replies`)를 출력합니다.
+에이전트용으로는 `difit comment get --port <port> --format agent` 를 사용할 수 있습니다. 스레드 하나당 한 줄의 JSON Lines(`id` / `file` / `side` / `line` / `body` / `replies`, 여러 diff 를 스코프 없이 가져오면 `diffId` 도)를 출력합니다. `--with-replies` / `--with-snapshot` 으로 답글 본문과 코드 스냅샷을 추가할 수 있습니다. `diffId` 가 붙은 줄은 `comment resolve --diff <diffId> <id>` 처럼 diff 를 지정해 해결해야 합니다.
 
 ## 🤖 에이전트에서 호출
 

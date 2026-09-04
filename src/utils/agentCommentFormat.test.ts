@@ -82,6 +82,13 @@ describe('toAgentCommentLine', () => {
     ]);
   });
 
+  it('omits messages entirely when a thread has no replies', () => {
+    const line = toAgentCommentLine(makeThread(), { withReplies: true });
+
+    expect(line.messages).toBeUndefined();
+    expect(JSON.parse(JSON.stringify(line))).not.toHaveProperty('messages');
+  });
+
   it('omits codeSnapshot unless --with-snapshot is given', () => {
     const thread = makeThread({ codeSnapshot: { content: 'const a = 1;', language: 'ts' } });
 
