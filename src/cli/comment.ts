@@ -1,5 +1,7 @@
 import { Command, Option } from 'commander';
 
+import type { DiffCommentThread, DiffsResponse } from '../types/diff.js';
+import { formatAgentComments } from '../utils/agentCommentFormat.js';
 import { parseCommentImportValue } from '../utils/commentImports.js';
 
 import { apiBaseUrl, handleCommandError } from './serverRequest.js';
@@ -10,6 +12,58 @@ interface CommentImportResponse {
   importId?: string;
   count?: number;
   warnings?: string[];
+}
+
+interface AgentGetOptions {
+  port: number;
+  diff?: string;
+  withReplies?: boolean;
+  withSnapshot?: boolean;
+}
+
+async function fetchThreads(port: number, diffId?: string): Promise<DiffCommentThread[]> {
+  const response = await fetch(`${apiBaseUrl(port, diffId)}/comments-json`);
+
+  if (!response.ok) {
+    console.error('Error: Failed to retrieve comments');
+    process.exit(1);
+  }
+
+  const data = (await response.json()) as { threads?: DiffCommentThread[] };
+  return data.threads ?? [];
+}
+
+/**
+ * `/api/comments-json` only ever answers for one diff (the scoped one, or the active
+ * one when unscoped). To cover every diff of a multi-diff server we list the diffs
+ * first and fetch each one, tagging its lines with `diffId`.
+ */
+async function collectAgentOutput(opts: AgentGetOptions): Promise<string> {
+  const formatOptions = { withReplies: opts.withReplies, withSnapshot: opts.withSnapshot };
+
+  if (opts.diff) {
+    return formatAgentComments(await fetchThreads(opts.port, opts.diff), formatOptions);
+  }
+
+  const diffsResponse = await fetch(`${apiBaseUrl(opts.port)}/diffs`);
+  const diffs = diffsResponse.ok
+    ? ((await diffsResponse.json()) as DiffsResponse).diffs
+    : undefined;
+
+  if (!diffs || diffs.length <= 1) {
+    return formatAgentComments(await fetchThreads(opts.port), formatOptions);
+  }
+
+  const sections = await Promise.all(
+    diffs.map(async (entry) =>
+      formatAgentComments(await fetchThreads(opts.port, entry.id), {
+        ...formatOptions,
+        diffId: entry.id,
+      }),
+    ),
+  );
+
+  return sections.filter((section) => section.length > 0).join('\n');
 }
 
 async function parseCommentAddInput(json?: string): Promise<string> {
@@ -79,31 +133,57 @@ export function createCommentCommand(): Command {
     .requiredOption('--port <port>', 'port of the running difit server', parseInt)
     .option('--diff <id>', 'target a specific diff on the server (see `difit diff list`)')
     .addOption(
-      new Option('--format <format>', 'output format').choices(['text', 'json']).default('text'),
+      new Option(
+        '--format <format>',
+        'output format ("agent" prints JSON Lines, one thread per line; a line carrying `diffId` must be resolved with `comment resolve --diff <diffId>`)',
+      )
+        .choices(['text', 'json', 'agent'])
+        .default('text'),
     )
-    .action(async (opts: { port: number; format: string; diff?: string }) => {
-      try {
-        const endpoint = opts.format === 'json' ? '/comments-json' : '/comments-output';
-        const response = await fetch(`${apiBaseUrl(opts.port, opts.diff)}${endpoint}`);
-
-        if (!response.ok) {
-          console.error('Error: Failed to retrieve comments');
-          process.exit(1);
-        }
-
-        if (opts.format === 'json') {
-          const data: unknown = await response.json();
-          console.log(JSON.stringify(data));
-        } else {
-          const text = await response.text();
-          if (text.trim()) {
-            console.log(text);
+    .option(
+      '--with-replies',
+      'agent format: include replies as `messages` (omitted when there are none)',
+    )
+    .option('--with-snapshot', 'agent format: include the code snapshot as `snippet`')
+    .action(
+      async (opts: {
+        port: number;
+        format: string;
+        diff?: string;
+        withReplies?: boolean;
+        withSnapshot?: boolean;
+      }) => {
+        try {
+          if (opts.format === 'agent') {
+            const output = await collectAgentOutput(opts);
+            if (output) {
+              console.log(output);
+            }
+            return;
           }
+
+          const endpoint = opts.format === 'json' ? '/comments-json' : '/comments-output';
+          const response = await fetch(`${apiBaseUrl(opts.port, opts.diff)}${endpoint}`);
+
+          if (!response.ok) {
+            console.error('Error: Failed to retrieve comments');
+            process.exit(1);
+          }
+
+          if (opts.format === 'json') {
+            const data: unknown = await response.json();
+            console.log(JSON.stringify(data));
+          } else {
+            const text = await response.text();
+            if (text.trim()) {
+              console.log(text);
+            }
+          }
+        } catch (error) {
+          handleCommandError(error, opts.port);
         }
-      } catch (error) {
-        handleCommandError(error, opts.port);
-      }
-    });
+      },
+    );
 
   comment
     .command('resolve')

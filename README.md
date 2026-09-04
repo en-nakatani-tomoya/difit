@@ -190,6 +190,12 @@ difit comment get --port 4966 --diff yoqzhlmk
 Without `--diff`, `comment add` / `comment resolve` target the most recently added diff,
 and `comment get` reports the comments of every hosted diff.
 
+`comment get --format agent` prints JSON Lines, one thread per line, with the fields `id`,
+`file`, `side`, `line`, `body` and `replies` — plus `diffId` when several diffs are hosted and no
+`--diff` is given. `--with-replies` and `--with-snapshot` add the omitted parts back. When a line
+carries `diffId`, pass it back as `comment resolve --diff <diffId> <id>`: an unscoped `resolve`
+only looks at the most recently added diff and reports the id as not found.
+
 ## 💬 Comment System
 
 difit includes a review comment system that makes it easy to provide feedback to AI coding agents:

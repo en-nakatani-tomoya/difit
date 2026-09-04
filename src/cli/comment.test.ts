@@ -46,7 +46,13 @@ describe('createCommentCommand', () => {
       const formatOption = getCommand.options.find((o) => o.long === '--format');
       expect(formatOption).toBeDefined();
       expect(formatOption?.defaultValue).toBe('text');
-      expect(formatOption?.argChoices).toEqual(['text', 'json']);
+      expect(formatOption?.argChoices).toEqual(['text', 'json', 'agent']);
+    });
+
+    it('has --with-replies and --with-snapshot options', () => {
+      const longs = getCommand.options.map((o) => o.long);
+      expect(longs).toContain('--with-replies');
+      expect(longs).toContain('--with-snapshot');
     });
   });
 
@@ -225,6 +231,131 @@ describe('comment subcommand integration', () => {
       await command.parseAsync(['node', 'difit', 'get', '--port', '4966']);
 
       expect(consoleOutput).toHaveLength(0);
+    });
+
+    describe('agent format', () => {
+      const thread = {
+        id: 't_abc123',
+        filePath: 'src/main.ts',
+        createdAt: '2026-09-04T00:00:00.000Z',
+        updatedAt: '2026-09-04T00:00:00.000Z',
+        position: { side: 'new', line: 42 },
+        codeSnapshot: { content: 'const a = 1;' },
+        messages: [
+          {
+            id: 'm_1',
+            body: 'Fix this',
+            author: 'user',
+            createdAt: '2026-09-04T00:00:00.000Z',
+            updatedAt: '2026-09-04T00:00:00.000Z',
+          },
+        ],
+      };
+
+      it('prints one JSON line per thread', async () => {
+        mockFetch
+          .mockResolvedValueOnce(jsonResponse({ diffs: [{ id: 'aaa' }], activeDiffId: 'aaa' }))
+          .mockResolvedValueOnce(jsonResponse({ version: 1, threads: [thread] }));
+
+        const command = createCommentCommand();
+        await command.parseAsync(['node', 'difit', 'get', '--port', '4966', '--format', 'agent']);
+
+        expect(mockFetch).toHaveBeenCalledWith('http://localhost:4966/api/comments-json');
+        expect(JSON.parse(consoleOutput[0])).toEqual({
+          id: 't_abc123',
+          file: 'src/main.ts',
+          side: 'new',
+          line: 42,
+          body: 'Fix this',
+          replies: 0,
+        });
+      });
+
+      it('stays silent when there are no threads', async () => {
+        mockFetch
+          .mockResolvedValueOnce(jsonResponse({ diffs: [{ id: 'aaa' }], activeDiffId: 'aaa' }))
+          .mockResolvedValueOnce(jsonResponse({ version: 1, threads: [] }));
+
+        const command = createCommentCommand();
+        await command.parseAsync(['node', 'difit', 'get', '--port', '4966', '--format', 'agent']);
+
+        expect(consoleOutput).toHaveLength(0);
+        expect(consoleErrors).toHaveLength(0);
+        expect(process.exit).not.toHaveBeenCalled();
+      });
+
+      it('scopes to a single diff and omits diffId with --diff', async () => {
+        mockFetch.mockResolvedValue(jsonResponse({ version: 1, threads: [thread] }));
+
+        const command = createCommentCommand();
+        await command.parseAsync([
+          'node',
+          'difit',
+          'get',
+          '--port',
+          '4966',
+          '--diff',
+          'yoqzhlmk',
+          '--format',
+          'agent',
+        ]);
+
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+        expect(mockFetch).toHaveBeenCalledWith(
+          'http://localhost:4966/api/d/yoqzhlmk/comments-json',
+        );
+        expect(JSON.parse(consoleOutput[0]).diffId).toBeUndefined();
+      });
+
+      it('tags each line with diffId on a multi-diff server without a scope', async () => {
+        mockFetch
+          .mockResolvedValueOnce(
+            jsonResponse({ diffs: [{ id: 'aaa' }, { id: 'bbb' }], activeDiffId: 'bbb' }),
+          )
+          .mockResolvedValueOnce(jsonResponse({ version: 1, threads: [thread] }))
+          .mockResolvedValueOnce(
+            jsonResponse({ version: 1, threads: [{ ...thread, id: 't_def456' }] }),
+          );
+
+        const command = createCommentCommand();
+        await command.parseAsync(['node', 'difit', 'get', '--port', '4966', '--format', 'agent']);
+
+        const lines = consoleOutput[0].split('\n').map((l) => JSON.parse(l));
+        expect(lines.map((l) => [l.id, l.diffId])).toEqual([
+          ['t_abc123', 'aaa'],
+          ['t_def456', 'bbb'],
+        ]);
+      });
+
+      it('adds snippet only with --with-snapshot', async () => {
+        mockFetch
+          .mockResolvedValueOnce(jsonResponse({ diffs: [{ id: 'aaa' }], activeDiffId: 'aaa' }))
+          .mockResolvedValueOnce(jsonResponse({ version: 1, threads: [thread] }));
+
+        const command = createCommentCommand();
+        await command.parseAsync([
+          'node',
+          'difit',
+          'get',
+          '--port',
+          '4966',
+          '--format',
+          'agent',
+          '--with-snapshot',
+        ]);
+
+        expect(JSON.parse(consoleOutput[0]).snippet).toBe('const a = 1;');
+      });
+
+      it('handles connection error', async () => {
+        mockFetch.mockRejectedValue(new TypeError('fetch failed'));
+
+        const command = createCommentCommand();
+        await command.parseAsync(['node', 'difit', 'get', '--port', '9999', '--format', 'agent']);
+
+        expect(consoleErrors[0]).toContain('Cannot connect');
+        expect(process.exit).toHaveBeenCalledWith(1);
+      });
     });
   });
 

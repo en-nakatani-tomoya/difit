@@ -176,6 +176,8 @@ src/components/Button.tsx:L42-L48   # この行が自動的に追加されます
 この部分は不要です
 ```
 
+エージェント向けには `difit comment get --port <port> --format agent` が使えます。1 スレッド 1 行の JSON Lines（`id` / `file` / `side` / `line` / `body` / `replies`、複数 diff をスコープ無しで取得した場合は `diffId` も）を出力します。`--with-replies` / `--with-snapshot` で返信本文とコードスナップショットを追加できます。`diffId` が付いた行は `comment resolve --diff <diffId> <id>` のように diff を指定して解決してください。
+
 ## 🤖 エージェントからの呼び出し
 
 AIエージェントから difit を使うための skill 群を以下でインストールできます。
