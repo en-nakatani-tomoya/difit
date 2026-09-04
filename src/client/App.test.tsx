@@ -22,20 +22,14 @@ vi.mock('./hooks/useViewport', () => ({
 vi.mock('./hooks/useDiffComments', () => ({
   useDiffComments: vi.fn(() => ({
     hasLoadedComments: true,
-    comments: [],
     threads: mockComments,
-    replaceThreads: mockReplaceThreads,
-    addComment: vi.fn(),
+    refreshThreads: mockRefreshThreads,
     addThread: vi.fn(),
-    removeComment: vi.fn(),
     removeThread: vi.fn(),
     removeMessage: vi.fn(),
     replyToThread: vi.fn(),
-    updateComment: vi.fn(),
     updateMessage: vi.fn(),
     clearAllComments: mockClearAllComments,
-    applyCommentImports: mockApplyCommentImports,
-    generatePrompt: vi.fn(),
     generateThreadPrompt: vi.fn(),
     generateAllCommentsPrompt: mockGenerateAllCommentsPrompt,
   })),
@@ -68,20 +62,24 @@ const mockWatchState: ClientWatchState = {
   connectionStatus: 'connected',
 };
 
+let mockOnCommentsChanged: (() => Promise<void>) | undefined;
 vi.mock('./hooks/useFileWatch', () => ({
-  useFileWatch: vi.fn((onReload?: () => Promise<void>) => ({
-    shouldReload: mockWatchState.shouldReload,
-    isConnected: true,
-    error: null,
-    reload: vi.fn(async () => {
-      if (onReload) {
-        await onReload();
-      }
-      mockWatchState.shouldReload = false;
-      mockWatchState.lastChangeType = null;
-    }),
-    watchState: mockWatchState,
-  })),
+  useFileWatch: vi.fn((onReload?: () => Promise<void>, onCommentsChanged?: () => Promise<void>) => {
+    mockOnCommentsChanged = onCommentsChanged;
+    return {
+      shouldReload: mockWatchState.shouldReload,
+      isConnected: true,
+      error: null,
+      reload: vi.fn(async () => {
+        if (onReload) {
+          await onReload();
+        }
+        mockWatchState.shouldReload = false;
+        mockWatchState.lastChangeType = null;
+      }),
+      watchState: mockWatchState,
+    };
+  }),
 }));
 
 // Mock navigator.sendBeacon
@@ -121,9 +119,8 @@ Object.defineProperty(window, 'EventSource', {
 });
 
 let mockComments: DiffCommentThread[] = [];
-const mockReplaceThreads = vi.fn();
+const mockRefreshThreads = vi.fn(async () => {});
 const mockClearAllComments = vi.fn();
-const mockApplyCommentImports = vi.fn(() => []);
 const mockGenerateAllCommentsPrompt = vi.fn(() => 'formatted prompt');
 
 function createMockThread({
@@ -173,7 +170,8 @@ beforeEach(() => {
   MockEventSource.clearInstances();
   mockViewedFiles = new Set<string>();
   mockHasLoadedInitialViewedFiles = true;
-  mockReplaceThreads.mockReset();
+  mockRefreshThreads.mockClear();
+  mockOnCommentsChanged = undefined;
   mockGenerateAllCommentsPrompt.mockClear();
 });
 
@@ -200,8 +198,6 @@ describe('App Component - Clear Comments Functionality', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockComments = [];
-    mockApplyCommentImports.mockReset();
-    mockApplyCommentImports.mockReturnValue([]);
     mockConfirm.mockReturnValue(false);
     mockFetch(mockDiffResponse);
   });
@@ -291,30 +287,19 @@ describe('App Component - Clear Comments Functionality', () => {
   });
 
   describe('Clean flag on Startup', () => {
-    it('should clear existing comments when clearComments flag is true in response', async () => {
-      const responseWithClearFlag: DiffResponse = {
-        ...mockDiffResponse,
-        clearComments: true,
-      };
-
-      mockFetch(responseWithClearFlag);
+    it('leaves comments alone when clearComments is true (the server already wiped them)', async () => {
+      mockFetch({ ...mockDiffResponse, clearComments: true });
 
       renderApp();
 
       await waitFor(() => {
-        expect(mockClearAllComments).toHaveBeenCalledWith({
-          resetAppliedCommentImportIds: true,
-        });
+        expect(mockClearViewedFiles).toHaveBeenCalled();
       });
+      expect(mockClearAllComments).not.toHaveBeenCalled();
     });
 
     it('should clear viewed files when clearComments flag is true in response', async () => {
-      const responseWithClearFlag: DiffResponse = {
-        ...mockDiffResponse,
-        clearComments: true,
-      };
-
-      mockFetch(responseWithClearFlag);
+      mockFetch({ ...mockDiffResponse, clearComments: true });
 
       renderApp();
 
@@ -323,175 +308,97 @@ describe('App Component - Clear Comments Functionality', () => {
       });
     });
 
-    it('should not clear comments when clearComments flag is false', async () => {
-      const responseWithoutClearFlag: DiffResponse = {
-        ...mockDiffResponse,
-        clearComments: false,
-      };
-
-      mockFetch(responseWithoutClearFlag);
+    it('should not clear viewed files when clearComments flag is false', async () => {
+      mockFetch({ ...mockDiffResponse, clearComments: false });
 
       renderApp();
 
-      await waitFor(() => {
-        expect(mockClearAllComments).not.toHaveBeenCalled();
-      });
+      await screen.findAllByText('test.ts');
+      expect(mockClearViewedFiles).not.toHaveBeenCalled();
+      expect(mockClearAllComments).not.toHaveBeenCalled();
     });
 
-    it('should not clear comments when clearComments flag is undefined', async () => {
-      const responseWithoutFlag: DiffResponse = {
-        ...mockDiffResponse,
-        // clearComments is undefined
-      };
-
-      mockFetch(responseWithoutFlag);
+    it('should not clear viewed files when clearComments flag is undefined', async () => {
+      mockFetch({ ...mockDiffResponse });
 
       renderApp();
 
-      await waitFor(() => {
-        expect(mockClearAllComments).not.toHaveBeenCalled();
-      });
+      await screen.findAllByText('test.ts');
+      expect(mockClearViewedFiles).not.toHaveBeenCalled();
+      expect(mockClearAllComments).not.toHaveBeenCalled();
     });
 
-    it('should log message when clearing comments via CLI flag', async () => {
+    it('should log message when clearing viewed files via CLI flag', async () => {
       const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-
-      const responseWithClearFlag: DiffResponse = {
-        ...mockDiffResponse,
-        clearComments: true,
-      };
-
-      mockFetch(responseWithClearFlag);
+      mockFetch({ ...mockDiffResponse, clearComments: true });
 
       renderApp();
 
       await waitFor(() => {
         expect(consoleLogSpy).toHaveBeenCalledWith(
-          '✅ All existing comments and viewed files cleared as requested via --clean flag',
+          '✅ Viewed files cleared as requested via --clean flag',
         );
       });
 
       consoleLogSpy.mockRestore();
     });
+  });
 
-    it('hydrates comments from the server comment session on startup', async () => {
-      const serverThreads = [
-        createMockThread({
-          id: 'imported-thread',
-          filePath: 'test.ts',
-          line: 10,
-          body: 'Imported comment',
-        }),
-      ];
-
-      vi.mocked(global.fetch).mockImplementation((input) => {
-        const url = String(input);
-
-        if (url.startsWith('/api/comments-json')) {
-          return Promise.resolve({
-            ok: true,
-            json: async () => ({ threads: serverThreads }),
-          } as Response);
-        }
-
-        if (url.startsWith('/api/comments')) {
-          return Promise.resolve({
-            ok: true,
-            json: async () => ({ success: true }),
-          } as Response);
-        }
-
-        if (url === '/api/revisions') {
-          return Promise.resolve({
-            ok: true,
-            json: async () => null,
-          } as Response);
-        }
-
-        return Promise.resolve({
-          ok: true,
-          json: async () => mockDiffResponse,
-          blob: async () => ({ size: 1024 }),
-        } as Response);
-      });
-
+  describe('Server-owned comment session', () => {
+    it('binds the comment hook to the resolved diff selection', async () => {
       renderApp();
 
       await waitFor(() => {
-        expect(mockReplaceThreads).toHaveBeenCalledWith(serverThreads);
+        const builder = vi.mocked(useDiffComments).mock.lastCall?.[0];
+        expect(builder).toBeTypeOf('function');
+        expect(builder?.('/api/comments-json')).toBe('/api/comments-json?base=HEAD%5E&target=HEAD');
       });
-
-      expect(vi.mocked(global.fetch)).toHaveBeenCalledWith(
-        '/api/comments-json?base=HEAD%5E&target=HEAD',
-      );
     });
 
-    it('preserves server-provided comments after clearing local comments on startup', async () => {
-      mockComments = [
-        createMockThread({
-          id: 'stale-local-thread',
-          filePath: 'test.ts',
-          line: 5,
-          body: 'Stale local comment',
-        }),
-      ];
-      const serverThreads = [
-        createMockThread({
-          id: 'imported-thread',
-          filePath: 'test.ts',
-          line: 10,
-          body: 'Imported comment',
-        }),
-      ];
-      const responseWithClearFlag: DiffResponse = {
-        ...mockDiffResponse,
-        clearComments: true,
-      };
-
-      vi.mocked(global.fetch).mockImplementation((input) => {
-        const url = String(input);
-
-        if (url.startsWith('/api/comments-json')) {
-          return Promise.resolve({
-            ok: true,
-            json: async () => ({ threads: serverThreads }),
-          } as Response);
-        }
-
-        if (url.startsWith('/api/comments')) {
-          return Promise.resolve({
-            ok: true,
-            json: async () => ({ success: true }),
-          } as Response);
-        }
-
-        if (url === '/api/revisions') {
-          return Promise.resolve({
-            ok: true,
-            json: async () => null,
-          } as Response);
-        }
-
-        return Promise.resolve({
-          ok: true,
-          json: async () => responseWithClearFlag,
-          blob: async () => ({ size: 1024 }),
-        } as Response);
-      });
+    it('adds the merge-base mode to the comment session scope', async () => {
+      mockFetch({ ...mockDiffResponse, requestedBaseMode: 'merge-base' });
 
       renderApp();
 
       await waitFor(() => {
-        expect(mockClearAllComments).toHaveBeenCalledWith({
-          resetAppliedCommentImportIds: true,
-        });
+        const builder = vi.mocked(useDiffComments).mock.lastCall?.[0];
+        expect(builder?.('/api/comments-json')).toBe(
+          '/api/comments-json?base=HEAD%5E&target=HEAD&baseMode=merge-base',
+        );
       });
+    });
+
+    it('never pushes local threads to the server wholesale', async () => {
+      mockComments = [
+        createMockThread({ id: 'test-1', filePath: 'test.ts', line: 10, body: 'Test comment' }),
+      ];
+      const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
+
+      renderApp();
+
+      await screen.findAllByText('test.ts');
+
+      const commentCalls = vi
+        .mocked(global.fetch)
+        .mock.calls.filter(([url]) => String(url).startsWith('/api/comments'));
+      expect(commentCalls).toHaveLength(0);
+      expect(addEventListenerSpy).not.toHaveBeenCalledWith('beforeunload', expect.any(Function));
+      expect(navigator.sendBeacon).not.toHaveBeenCalled();
+      addEventListenerSpy.mockRestore();
+    });
+
+    it('re-reads the session when the watch stream reports a comment change', async () => {
+      renderApp();
 
       await waitFor(() => {
-        expect(mockReplaceThreads).toHaveBeenCalledWith(serverThreads);
+        expect(mockOnCommentsChanged).toBeTypeOf('function');
       });
 
-      expect(mockReplaceThreads).not.toHaveBeenCalledWith([...serverThreads, ...mockComments]);
+      await act(async () => {
+        await mockOnCommentsChanged?.();
+      });
+
+      expect(mockRefreshThreads).toHaveBeenCalledTimes(1);
     });
   });
 });
@@ -555,84 +462,6 @@ describe('App Component - Comment sync', () => {
     vi.clearAllMocks();
     mockConfirm.mockReturnValue(false);
     mockFetch(mockDiffResponse);
-  });
-
-  it('syncs an empty comment list after the last comment is resolved', async () => {
-    mockComments = [
-      createMockThread({ id: 'test-1', filePath: 'test.ts', line: 10, body: 'Test comment' }),
-    ];
-
-    const mockGlobalFetch = vi.mocked(global.fetch);
-    const { rerender } = renderApp();
-
-    await waitFor(() => {
-      const commentCalls = mockGlobalFetch.mock.calls.filter(([url]) =>
-        String(url).startsWith('/api/comments?'),
-      );
-      expect(commentCalls).toHaveLength(1);
-
-      const [url, request] = commentCalls[0] as [string, RequestInit];
-      expect(url).toBe('/api/comments?base=HEAD%5E&target=HEAD');
-      expect(request.method).toBe('POST');
-      expect(JSON.parse(String(request.body))).toEqual({
-        threads: [
-          expect.objectContaining({
-            id: 'test-1',
-            filePath: 'test.ts',
-            position: { side: 'new', line: 10 },
-            messages: [
-              expect.objectContaining({
-                id: 'test-1',
-                body: 'Test comment',
-                author: 'User',
-              }),
-            ],
-          }),
-        ],
-      });
-    });
-
-    mockComments = [];
-    rerender(
-      <HotkeysProvider initiallyActiveScopes={['navigation']}>
-        <App />
-      </HotkeysProvider>,
-    );
-
-    await waitFor(() => {
-      const commentCalls = mockGlobalFetch.mock.calls.filter(([url]) =>
-        String(url).startsWith('/api/comments?'),
-      );
-      expect(commentCalls).toHaveLength(2);
-
-      const [url, request] = commentCalls[1] as [string, RequestInit];
-      expect(url).toBe('/api/comments?base=HEAD%5E&target=HEAD');
-      expect(request.method).toBe('POST');
-      expect(JSON.parse(String(request.body))).toEqual({ threads: [] });
-    });
-  });
-
-  it('sends an empty comment list on unload when no comments remain', async () => {
-    mockComments = [];
-    const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
-
-    renderApp();
-
-    await waitFor(() => {
-      expect(addEventListenerSpy).toHaveBeenCalledWith('beforeunload', expect.any(Function));
-    });
-
-    const beforeUnloadHandler = addEventListenerSpy.mock.calls.find(
-      ([eventName]) => eventName === 'beforeunload',
-    )?.[1] as (() => void) | undefined;
-    expect(beforeUnloadHandler).toBeDefined();
-    beforeUnloadHandler?.();
-
-    expect(navigator.sendBeacon).toHaveBeenCalledWith(
-      '/api/comments?base=HEAD%5E&target=HEAD',
-      JSON.stringify({ threads: [] }),
-    );
-    addEventListenerSpy.mockRestore();
   });
 
   it('shows author badges in the comments modal when the diff has multiple authors', async () => {
@@ -718,8 +547,11 @@ describe('App Component - Diff Mode Persistence', () => {
     fireEvent.click(refreshButton);
 
     await waitFor(() => {
-      // 4 calls: initial /api/diff, /api/revisions, initial /api/comments sync, and refresh /api/diff
-      expect(mockGlobalFetch).toHaveBeenCalledTimes(4);
+      const diffCalls = mockGlobalFetch.mock.calls.filter(([url]) =>
+        String(url).startsWith('/api/diff?'),
+      );
+      // Initial /api/diff and the refresh; comments are never pushed from the client.
+      expect(diffCalls).toHaveLength(2);
     });
 
     await waitFor(() => {
@@ -836,13 +668,9 @@ describe('App Component - Merge-base selection', () => {
     renderApp();
 
     await waitFor(() => {
-      expect(vi.mocked(useDiffComments)).toHaveBeenCalledWith(
-        '1234567',
-        '98664e1',
-        'abc123',
-        undefined,
-        undefined,
-        undefined,
+      const builder = vi.mocked(useDiffComments).mock.lastCall?.[0];
+      expect(builder?.('/api/comments-json')).toBe(
+        '/api/comments-json?base=1234567&target=98664e1',
       );
     });
 

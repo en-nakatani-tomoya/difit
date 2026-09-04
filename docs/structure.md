@@ -126,8 +126,13 @@ to target a specific diff.
 | `/api/diffs`           | GET    | List the diffs hosted by the server                |
 | `/api/diffs`           | POST   | Register an additional diff                        |
 | `/api/diff`            | GET    | Retrieve diff data with optional whitespace ignore |
-| `/api/comments`        | POST   | Save review comments                               |
+| `/api/comments-json`   | GET    | Current comment session (`{ version, threads }`)   |
+| `/api/comments/:id`    | PUT    | Create or replace one comment thread               |
+| `/api/comments/:id`    | DELETE | Remove one comment thread                          |
+| `/api/comments`        | POST   | Replace the whole session (`baseVersion` required) |
+| `/api/comment-imports` | POST   | Merge externally produced comments (agents, CLI)   |
 | `/api/comments-output` | GET    | Get formatted comments output                      |
+| `/api/watch`           | GET    | SSE stream; `commentsChanged` events live here     |
 | `/api/heartbeat`       | GET    | SSE endpoint for tab close detection               |
 
 ### Diff Namespacing
@@ -143,12 +148,59 @@ A server can host several independent diffs of the same repository:
 - The browser page for a diff is `/d/:diffId`; the client pins itself to the diff id returned
   by `/api/diff` and rewrites its address bar to match.
 
+### Comment Source of Truth
+
+The server owns review comments; the browser is a viewer/editor of the server's session.
+
+- A **comment session** is `{ threads, version }` keyed by diff id and the _resolved_
+  revision selection `(base, target, baseMode)`. `version` is an in-process counter bumped on
+  every change and echoed to clients so conflicting writes are detectable.
+- At startup the server restores the persisted session (below), applies `--clean` by deleting
+  it, and merges `--comment` / `--pr` imports with `mergeCommentImports` **before** the first
+  request. `GET /api/diff` no longer carries `commentImports`; clients never import anything.
+- The client (`useDiffComments`) loads `GET /api/comments-json`, applies edits optimistically,
+  and sends each edit as `PUT /api/comments/:threadId` (add / reply / edit) or
+  `DELETE /api/comments/:threadId`. Other tabs learn about the change through the
+  `commentsChanged` SSE event and re-read the session. Nothing about comments is kept in
+  `localStorage` any more; only `viewedFiles` stays there.
+- `POST /api/comments` is a compare-and-set whole-list replacement: `baseVersion` is
+  mandatory (400 without it) and must equal the current version (409 otherwise, with the
+  server's current `version` and `threads` in the body). A stale tab therefore cannot wipe a
+  comment that arrived after its last read. The client uses it for "Cleanup All Prompt".
+- `POST /api/comment-imports` merges (idempotently) and is the entry point for agents and
+  the `difit comment add` CLI.
+
+### Comment Storage
+
+Sessions survive the server process. Each session is one JSON file:
+
+```
+<store root>/<repositoryId>/<base>_<target>[_merge-base].json
+```
+
+- `<store root>` is, in order of precedence: `$DIFIT_COMMENT_STORE_DIR`;
+  `<git common dir>/difit/comments` (i.e. inside `.git/`, so never committed, and shared by all
+  worktrees of the repository); `<$DIFIT_CONFIG_DIR or ~/.difit>/comments` when the working
+  directory is not a Git repository.
+- `repositoryId` is `sha256(absolute repository path)`, the same id the client receives in
+  `GET /api/diff`.
+- `base` / `target` are the resolved commitish values of the session. Every path component
+  is escaped (`[^A-Za-z0-9.-]` → `_<hex>_`) so refs such as `feat/x` cannot traverse
+  directories or collide.
+- stdin diffs use `stdin_<sha256(patch) prefix>`; `--pr <url>` uses the escaped PR URL so
+  comments follow the pull request across new pushes.
+- File format: `{ version: 1, selection, updatedAt, threads }`. Writes are atomic
+  (temp file + rename); a session that becomes empty deletes its file. Unreadable files are
+  ignored with a warning rather than failing startup.
+- `--clean` deletes the file of the diff the server starts with.
+
 ### Request Flow
 
 1. CLI validates arguments and starts server
-2. Server fetches Git diff data on startup
-3. Client connects and requests diff via API
-4. Comments are stored in memory
+2. Server fetches Git diff data, restores the persisted comment session, and merges
+   `--comment` imports into it
+3. Client connects, requests the diff via API, and reads the comment session
+4. Comment edits are written to the server, persisted to the store, and broadcast over SSE
 5. On disconnect, comments are output to console
 
 ## Dependencies

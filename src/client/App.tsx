@@ -2,7 +2,6 @@ import { Columns, AlignLeft, Settings, PanelLeftClose, PanelLeft, Keyboard } fro
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 
 import {
-  type DiffCommentThread,
   type DiffResponse,
   type DiffSelection,
   type DiffViewMode,
@@ -12,7 +11,6 @@ import {
   type RevisionsResponse,
 } from '../types/diff';
 import { DEFAULT_DIFF_VIEW_MODE, normalizeDiffViewMode } from '../utils/diffMode';
-import { mergeCommentThreads } from '../utils/commentImports';
 import {
   createDiffSelection,
   diffSelectionsEqual,
@@ -185,39 +183,9 @@ function App() {
   const { settings, updateSettings } = useAppearanceSettings();
   const { isMobile, isDesktop } = useViewport();
 
-  // New diff-aware comment system
-  const {
-    hasLoadedComments,
-    threads,
-    replaceThreads,
-    addThread,
-    replyToThread,
-    removeThread,
-    removeMessage,
-    updateMessage,
-    clearAllComments,
-    generateThreadPrompt,
-    generateAllCommentsPrompt,
-  } = useDiffComments(
-    resolvedSelection?.baseCommitish,
-    resolvedSelection?.targetCommitish,
-    diffData?.commit, // Using commit as currentCommitHash
-    undefined, // branchToHash map - could be populated from server data
-    diffData?.repositoryId, // Repository identifier for storage isolation
-    resolvedSelection?.baseMode,
-  );
-
   const { diffs: hostedDiffs, now: diffsNow } = useDiffEntries();
   const currentDiffId = diffData?.diffId ?? getScopedDiffId();
   const showDiffTabBar = hostedDiffs.length > 1;
-  const showMobileCommentsBar = isMobile && threads.length > 0;
-  const commentsContextKey = useMemo(() => {
-    if (!resolvedSelectionKey) {
-      return null;
-    }
-
-    return `${diffData?.repositoryId ?? 'default'}:${resolvedSelectionKey}`;
-  }, [diffData?.repositoryId, resolvedSelectionKey]);
   const commentSessionQueryString = useMemo(() => {
     if (!resolvedSelection) {
       return null;
@@ -233,76 +201,29 @@ function App() {
 
     return params.toString();
   }, [resolvedSelection]);
-  const getCommentApiUrl = useCallback(
-    (path: string) => {
-      if (!commentSessionQueryString) {
-        return apiUrl(path);
-      }
-      return apiUrl(`${path}?${commentSessionQueryString}`);
-    },
-    [commentSessionQueryString],
-  );
-  const [bootstrappedCommentsKey, setBootstrappedCommentsKey] = useState<string | null>(null);
-  const hasBootstrappedComments =
-    commentsContextKey !== null && commentsContextKey === bootstrappedCommentsKey;
-  const bootstrappingCommentsKeyRef = useRef<string | null>(null);
-  const skipNextCommentSyncRef = useRef(false);
-  // Last server comment version seen; echoed back as baseVersion so the server can detect concurrent writes.
-  const serverCommentVersionRef = useRef<number | null>(null);
-  const pendingBootstrapAfterLocalResetRef = useRef(false);
-
-  useEffect(() => {
-    if (commentsContextKey !== bootstrappedCommentsKey) {
-      skipNextCommentSyncRef.current = false;
+  // Identity doubles as the comment session key: a new selection yields a new builder,
+  // which makes useDiffComments reload from the server.
+  const getCommentApiUrl = useMemo(() => {
+    if (!commentSessionQueryString) {
+      return null;
     }
-  }, [bootstrappedCommentsKey, commentsContextKey]);
+    return (path: string) => apiUrl(`${path}?${commentSessionQueryString}`);
+  }, [commentSessionQueryString]);
 
-  const fetchServerThreads = useCallback(async (): Promise<DiffCommentThread[]> => {
-    const response = await fetch(getCommentApiUrl('/api/comments-json'));
-    if (!response.ok) {
-      throw new Error(`Failed to fetch comments: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
-      version?: number;
-      threads?: DiffCommentThread[];
-    };
-    if (typeof payload.version === 'number') {
-      serverCommentVersionRef.current = payload.version;
-    }
-    return Array.isArray(payload.threads) ? payload.threads : [];
-  }, [getCommentApiUrl]);
-
-  const syncThreadsToServer = useCallback(
-    async (nextThreads: DiffCommentThread[]) => {
-      const response = await fetch(getCommentApiUrl('/api/comments'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          threads: nextThreads,
-          baseVersion: serverCommentVersionRef.current ?? undefined,
-        }),
-      });
-      if (!response.ok) {
-        return;
-      }
-
-      const result = (await response.json()) as {
-        version?: number;
-        merged?: boolean;
-        threads?: DiffCommentThread[];
-      };
-      if (typeof result.version === 'number') {
-        serverCommentVersionRef.current = result.version;
-      }
-      // Server merged in a concurrent change; adopt it so we don't push a stale set back.
-      if (result.merged && Array.isArray(result.threads)) {
-        skipNextCommentSyncRef.current = true;
-        replaceThreads(result.threads);
-      }
-    },
-    [getCommentApiUrl, replaceThreads],
-  );
+  // Comments live on the server; this hook mirrors that session and pushes edits to it.
+  const {
+    threads,
+    refreshThreads,
+    addThread,
+    replyToThread,
+    removeThread,
+    removeMessage,
+    updateMessage,
+    clearAllComments,
+    generateThreadPrompt,
+    generateAllCommentsPrompt,
+  } = useDiffComments(getCommentApiUrl);
+  const showMobileCommentsBar = isMobile && threads.length > 0;
 
   // Viewed files management
   const {
@@ -564,16 +485,11 @@ function App() {
   }, []);
   const handleCommentsChanged = useCallback(async () => {
     try {
-      const serverThreads = await fetchServerThreads();
-      skipNextCommentSyncRef.current = true;
-      replaceThreads(serverThreads);
-      if (commentsContextKey) {
-        setBootstrappedCommentsKey(commentsContextKey);
-      }
+      await refreshThreads();
     } catch (commentsError) {
       console.error('Failed to refresh comments from server:', commentsError);
     }
-  }, [commentsContextKey, fetchServerThreads, replaceThreads]);
+  }, [refreshThreads]);
 
   // File watch for reload functionality - initialize with callback
   const { shouldReload, reload, watchState } = useFileWatch(
@@ -896,89 +812,16 @@ function App() {
     [fetchDiffData, selectedRevision],
   );
 
-  // Clear comments and viewed files on initial load if requested via CLI flag
+  // `--clean`: the server already wiped its comment store before serving; only the
+  // browser-local viewed state remains for the client to reset.
   const hasCleanedRef = useRef(false);
   useEffect(() => {
     if (diffData?.clearComments && !hasCleanedRef.current) {
       hasCleanedRef.current = true;
-      pendingBootstrapAfterLocalResetRef.current = true;
-      clearAllComments({ resetAppliedCommentImportIds: true });
       clearViewedFiles();
-      console.log(
-        '✅ All existing comments and viewed files cleared as requested via --clean flag',
-      );
+      console.log('✅ Viewed files cleared as requested via --clean flag');
     }
-  }, [diffData?.clearComments, clearAllComments, clearViewedFiles]);
-
-  useEffect(() => {
-    if (!commentsContextKey || !hasLoadedComments) {
-      return;
-    }
-
-    if (bootstrappedCommentsKey === commentsContextKey) {
-      return;
-    }
-
-    if (bootstrappingCommentsKeyRef.current === commentsContextKey) {
-      return;
-    }
-
-    const shouldReplaceFromServer = pendingBootstrapAfterLocalResetRef.current;
-    pendingBootstrapAfterLocalResetRef.current = false;
-
-    bootstrappingCommentsKeyRef.current = commentsContextKey;
-    let cancelled = false;
-
-    const bootstrapComments = async () => {
-      try {
-        const serverThreads = await fetchServerThreads();
-        const nextThreads = shouldReplaceFromServer
-          ? serverThreads
-          : mergeCommentThreads(serverThreads, threads).threads;
-        if (cancelled) {
-          return;
-        }
-
-        skipNextCommentSyncRef.current = true;
-        replaceThreads(nextThreads);
-
-        if (
-          !shouldReplaceFromServer &&
-          JSON.stringify(serverThreads) !== JSON.stringify(nextThreads)
-        ) {
-          await syncThreadsToServer(nextThreads);
-        }
-      } catch (commentsError) {
-        if (!cancelled) {
-          console.error('Failed to bootstrap comments from server:', commentsError);
-        }
-      } finally {
-        if (!cancelled) {
-          setBootstrappedCommentsKey(commentsContextKey);
-        }
-        if (bootstrappingCommentsKeyRef.current === commentsContextKey) {
-          bootstrappingCommentsKeyRef.current = null;
-        }
-      }
-    };
-
-    void bootstrapComments();
-
-    return () => {
-      cancelled = true;
-      if (bootstrappingCommentsKeyRef.current === commentsContextKey) {
-        bootstrappingCommentsKeyRef.current = null;
-      }
-    };
-  }, [
-    bootstrappedCommentsKey,
-    commentsContextKey,
-    fetchServerThreads,
-    hasLoadedComments,
-    replaceThreads,
-    syncThreadsToServer,
-    threads,
-  ]);
+  }, [diffData?.clearComments, clearViewedFiles]);
 
   // Trigger sparkle animation when all files are viewed
   useEffect(() => {
@@ -998,42 +841,6 @@ function App() {
       }
     }
   }, [viewedFiles.size, diffData, hasTriggeredSparkles]);
-
-  // Send comments to server whenever they change and before page unload
-  useEffect(() => {
-    if (!hasBootstrappedComments) {
-      return;
-    }
-
-    const data = JSON.stringify({
-      threads,
-      baseVersion: serverCommentVersionRef.current ?? undefined,
-    });
-    const commentsApiUrl = getCommentApiUrl('/api/comments');
-
-    // Also handle page unload
-    const sendCommentsBeforeUnload = () => {
-      // Use sendBeacon for reliable delivery during page unload, including empty states.
-      navigator.sendBeacon(commentsApiUrl, data);
-    };
-
-    window.addEventListener('beforeunload', sendCommentsBeforeUnload);
-
-    if (skipNextCommentSyncRef.current) {
-      skipNextCommentSyncRef.current = false;
-      return () => {
-        window.removeEventListener('beforeunload', sendCommentsBeforeUnload);
-      };
-    }
-
-    syncThreadsToServer(threads).catch((syncError) => {
-      console.error('Failed to sync comments:', syncError);
-    });
-
-    return () => {
-      window.removeEventListener('beforeunload', sendCommentsBeforeUnload);
-    };
-  }, [getCommentApiUrl, hasBootstrappedComments, syncThreadsToServer, threads]);
 
   // Establish SSE connection for tab close detection
   useEffect(() => {

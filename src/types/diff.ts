@@ -60,8 +60,6 @@ export interface DiffResponse {
   requestedBaseMode?: BaseMode;
   clearComments?: boolean;
   repositoryId?: string;
-  commentImports?: CommentImport[];
-  commentImportId?: string;
 }
 
 export interface DiffEntrySummary {
@@ -102,19 +100,6 @@ export interface Comment {
 export interface LineSelection {
   side: DiffSide;
   lineNumber: number;
-}
-
-export interface LegacyDiffComment {
-  id: string;
-  filePath: string;
-  body: string;
-  author?: string;
-  createdAt: string; // ISO 8601 format
-  updatedAt: string; // ISO 8601 format
-
-  position: DiffCommentPosition;
-
-  codeSnapshot?: DiffCommentCodeSnapshot;
 }
 
 export interface DiffCommentMessage {
@@ -186,7 +171,8 @@ export interface LegacyDiffContextStorage {
   createdAt: string; // ISO 8601 format
   lastModifiedAt: string; // ISO 8601 format
 
-  comments: LegacyDiffComment[];
+  /** Pre-server-side-comment entries; their comments are ignored on read. */
+  comments: unknown[];
   viewedFiles: ViewedFileRecord[];
 }
 
@@ -198,9 +184,7 @@ export interface DiffContextStorage {
   createdAt: string; // ISO 8601 format
   lastModifiedAt: string; // ISO 8601 format
 
-  threads: DiffCommentThread[];
   viewedFiles: ViewedFileRecord[];
-  appliedCommentImportIds: string[];
 }
 
 export interface CommentThread {

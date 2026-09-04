@@ -126,7 +126,6 @@ const buildDiffPayload = (diff: DiffResponse): DiffResponse => ({
 export const installStaticApiBridge = (dataset: StaticDiffDataset): StaticApiBridge => {
   const originalFetch = window.fetch.bind(window);
   const OriginalEventSource = window.EventSource;
-  const originalSendBeacon = navigator.sendBeacon?.bind(navigator);
   const staticBlobWindow = window as Window & StaticBlobWindow;
   const originalStaticBlobUrls = staticBlobWindow.__DIFIT_STATIC_BLOB_URLS__;
 
@@ -207,12 +206,18 @@ export const installStaticApiBridge = (dataset: StaticDiffDataset): StaticApiBri
       });
     }
 
+    // Comment writes are accepted but not stored; the client keeps its optimistic copy.
     if (requestUrl.pathname === '/api/comments') {
-      return jsonResponse({ success: true });
+      return jsonResponse({ success: true, version: 0, threads: [] });
+    }
+
+    if (requestUrl.pathname.startsWith('/api/comments/')) {
+      return jsonResponse({ success: true, version: 0 });
     }
 
     if (requestUrl.pathname === '/api/comments-json') {
       return jsonResponse({
+        version: 0,
         threads: currentRevisionId ? (dataset.comments?.[currentRevisionId] ?? []) : [],
       });
     }
@@ -280,31 +285,11 @@ export const installStaticApiBridge = (dataset: StaticDiffDataset): StaticApiBri
 
   window.EventSource = StaticEventSource as unknown as typeof EventSource;
 
-  Object.defineProperty(navigator, 'sendBeacon', {
-    configurable: true,
-    writable: true,
-    value: ((url: string | URL, data?: BodyInit | null) => {
-      const target = typeof url === 'string' ? url : url.toString();
-      if (target.startsWith('/api/comments')) {
-        return true;
-      }
-      if (originalSendBeacon) {
-        return originalSendBeacon(url, data);
-      }
-      return true;
-    }) as Navigator['sendBeacon'],
-  });
-
   return {
     dataset,
     restore: () => {
       window.fetch = originalFetch;
       window.EventSource = OriginalEventSource;
-      Object.defineProperty(navigator, 'sendBeacon', {
-        configurable: true,
-        writable: true,
-        value: originalSendBeacon,
-      });
       staticBlobWindow.__DIFIT_STATIC_BLOB_URLS__ = originalStaticBlobUrls;
     },
   };
