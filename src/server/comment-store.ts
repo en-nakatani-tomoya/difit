@@ -1,5 +1,6 @@
 import { execFileSync } from 'child_process';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs';
+import { createHash } from 'crypto';
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, isAbsolute, join, resolve } from 'path';
 
@@ -13,6 +14,9 @@ export interface PersistedCommentSession {
   updatedAt: string;
   threads: DiffCommentThread[];
 }
+
+/** Longest file name (without `.json`) the store will produce; well under any NAME_MAX. */
+export const MAX_COMMENT_STORE_KEY_LENGTH = 200;
 
 /**
  * Escapes a value so it can be used as (part of) a file name without collisions:
@@ -28,6 +32,21 @@ export function encodeCommentStoreComponent(value: string): string {
     return value.replace(/\./g, '_2e_');
   }
   return value.replace(/[^A-Za-z0-9.-]/g, (char) => `_${char.charCodeAt(0).toString(16)}_`);
+}
+
+/**
+ * Keeps a store key within {@link MAX_COMMENT_STORE_KEY_LENGTH}: over-long keys (very long refs,
+ * PR URLs) become `<prefix>_<sha256 prefix>` so they stay unique and readable. Never cuts an
+ * `_xx_` escape in half; the hash covers the whole original key anyway.
+ */
+export function capCommentStoreKey(key: string): string {
+  if (key.length <= MAX_COMMENT_STORE_KEY_LENGTH) {
+    return key;
+  }
+  const digest = createHash('sha256').update(key).digest('hex').slice(0, 16);
+  const prefixLength = MAX_COMMENT_STORE_KEY_LENGTH - digest.length - 1;
+  const prefix = key.slice(0, prefixLength).replace(/_[0-9a-f]{0,3}$/, '');
+  return `${prefix}_${digest}`;
 }
 
 /** `<base>_<target>[_merge-base]`, matching the localStorage convention the client used to have. */
@@ -48,33 +67,48 @@ function resolveGitCommonDir(repositoryPath: string): string | undefined {
     if (!output) {
       return undefined;
     }
-    return isAbsolute(output) ? output : resolve(repositoryPath, output);
+    const absolute = isAbsolute(output) ? output : resolve(repositoryPath, output);
+    // realpath so `/tmp` vs `/private/tmp` (macOS) or symlinked checkouts hash identically.
+    return realpathSync(absolute);
   } catch {
     return undefined;
   }
 }
 
+export interface CommentStoreLocation {
+  /** Directory holding every repository's comment files. */
+  root: string;
+  /**
+   * Sub-directory for this repository. Hash of the git common dir, so every worktree and every
+   * subdirectory of one repository share it; hash of the path itself outside a repository.
+   */
+  repositoryKey: string;
+}
+
 /**
- * Root directory that holds every repository's comment files.
+ * Where comments for `repositoryPath` live.
  *
- * Precedence: `DIFIT_COMMENT_STORE_DIR` (tests, power users) → `<git common dir>/difit/comments`
- * (inside `.git`, so never committed; the common dir keeps worktrees of one repo together) →
- * `<DIFIT_CONFIG_DIR or ~/.difit>/comments` when the path is not a git repository (e.g. `--pr`
- * run from an arbitrary directory).
+ * Root precedence: `DIFIT_COMMENT_STORE_DIR` (tests, power users) → `<git common dir>/difit/comments`
+ * (inside `.git`, so never committed) → `<DIFIT_CONFIG_DIR or ~/.difit>/comments` when the path
+ * is not a git repository (e.g. `--pr` run from an arbitrary directory).
  */
-export function resolveCommentStoreRoot(repositoryPath: string): string {
+export function resolveCommentStoreLocation(repositoryPath: string): CommentStoreLocation {
+  const gitCommonDir = resolveGitCommonDir(repositoryPath);
+  const repositoryKey = createHash('sha256')
+    .update(gitCommonDir ?? resolve(repositoryPath))
+    .digest('hex');
+
   const override = process.env.DIFIT_COMMENT_STORE_DIR?.trim();
   if (override) {
-    return resolve(override);
+    return { root: resolve(override), repositoryKey };
   }
 
-  const gitCommonDir = resolveGitCommonDir(repositoryPath);
   if (gitCommonDir) {
-    return join(gitCommonDir, 'difit', 'comments');
+    return { root: join(gitCommonDir, 'difit', 'comments'), repositoryKey };
   }
 
   const configDir = process.env.DIFIT_CONFIG_DIR?.trim();
-  return join(configDir || join(homedir(), '.difit'), 'comments');
+  return { root: join(configDir || join(homedir(), '.difit'), 'comments'), repositoryKey };
 }
 
 /**
@@ -85,12 +119,12 @@ export function resolveCommentStoreRoot(repositoryPath: string): string {
 export class CommentStore {
   private readonly directory: string;
 
-  constructor(root: string, repositoryId: string) {
-    this.directory = join(root, encodeCommentStoreComponent(repositoryId));
+  constructor(location: CommentStoreLocation) {
+    this.directory = join(location.root, encodeCommentStoreComponent(location.repositoryKey));
   }
 
   filePath(key: string): string {
-    return join(this.directory, `${key}.json`);
+    return join(this.directory, `${capCommentStoreKey(key)}.json`);
   }
 
   read(key: string): PersistedCommentSession | undefined {

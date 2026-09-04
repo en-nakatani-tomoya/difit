@@ -175,18 +175,22 @@ The server owns review comments; the browser is a viewer/editor of the server's 
 Sessions survive the server process. Each session is one JSON file:
 
 ```
-<store root>/<repositoryId>/<base>_<target>[_merge-base].json
+<store root>/<repository key>/<base>_<target>[_merge-base].json
 ```
 
 - `<store root>` is, in order of precedence: `$DIFIT_COMMENT_STORE_DIR`;
-  `<git common dir>/difit/comments` (i.e. inside `.git/`, so never committed, and shared by all
-  worktrees of the repository); `<$DIFIT_CONFIG_DIR or ~/.difit>/comments` when the working
-  directory is not a Git repository.
-- `repositoryId` is `sha256(absolute repository path)`, the same id the client receives in
-  `GET /api/diff`.
+  `<git common dir>/difit/comments` (i.e. inside `.git/`, so never committed);
+  `<$DIFIT_CONFIG_DIR or ~/.difit>/comments` when the working directory is not a Git
+  repository.
+- `<repository key>` is `sha256(realpath of git rev-parse --git-common-dir)`, so the main
+  checkout, every linked worktree, and a launch from any subdirectory all restore the same
+  sessions. Outside a repository it is `sha256(absolute path)`. This is deliberately not the
+  `repositoryId` that `GET /api/diff` exposes (a hash of the launch path), which the client
+  keeps using to isolate `viewedFiles` in `localStorage`.
 - `base` / `target` are the resolved commitish values of the session. Every path component
   is escaped (`[^A-Za-z0-9.-]` → `_<hex>_`) so refs such as `feat/x` cannot traverse
-  directories or collide.
+  directories or collide. A file name longer than 200 characters is cut to
+  `<prefix>_<sha256 prefix>` so it always fits `NAME_MAX`.
 - stdin diffs use `stdin_<sha256(patch) prefix>`; `--pr <url>` uses the escaped PR URL so
   comments follow the pull request across new pushes.
 - File format: `{ version: 1, selection, updatedAt, threads }`. Writes are atomic

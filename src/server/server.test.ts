@@ -554,6 +554,58 @@ describe('Server Integration Tests', () => {
       }
     });
 
+    it('restores the same session from a linked worktree and from a subdirectory', async () => {
+      const { execFileSync } = await import('child_process');
+      const repo = await fs.mkdtemp(join(tmpdir(), 'difit-wt-repo-'));
+      const worktreeParent = await fs.mkdtemp(join(tmpdir(), 'difit-wt-link-'));
+      const worktree = join(worktreeParent, 'wt');
+      const run = (cwd: string, ...args: string[]) =>
+        execFileSync('git', args, { cwd, stdio: 'ignore' });
+      try {
+        run(repo, 'init', '-q', '-b', 'main');
+        run(
+          repo,
+          '-c',
+          'user.email=t@e.st',
+          '-c',
+          'user.name=t',
+          'commit',
+          '-q',
+          '--allow-empty',
+          '-m',
+          'init',
+        );
+        await fs.mkdir(join(repo, 'sub', 'dir'), { recursive: true });
+        run(repo, 'worktree', 'add', '-q', worktree, '-b', 'wt');
+
+        const main = await start({ repoPath: repo });
+        try {
+          await fetch(`http://localhost:${main.port}/api/comments/user-1`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ thread: userThread }),
+          });
+        } finally {
+          await stop(main);
+        }
+
+        for (const repoPath of [worktree, join(repo, 'sub', 'dir')]) {
+          const again = await start({ repoPath });
+          try {
+            const current = await session(again.port);
+            expect(current.threads.map((thread) => thread.id)).toEqual(['user-1']);
+          } finally {
+            await stop(again);
+          }
+        }
+        // One repository key for all three launch paths.
+        expect(readdirSync(commentStoreDir)).toHaveLength(1);
+      } finally {
+        await fs.rm(worktreeParent, { recursive: true, force: true });
+        await fs.rm(repo, { recursive: true, force: true });
+      }
+    });
+
     it('keys stdin sessions by patch content, and --pr sessions by the given store key', async () => {
       const byPatch = await start({
         stdinDiff: 'diff --git a/x b/x\n',

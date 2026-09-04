@@ -26,7 +26,6 @@ interface ReplyToThreadParams {
 export type CommentApiUrlBuilder = (path: string) => string;
 
 interface UseDiffCommentsReturn {
-  hasLoadedComments: boolean;
   threads: DiffCommentThread[];
   /** Re-reads the session from the server (used when another writer changed it). */
   refreshThreads: () => Promise<void>;
@@ -78,7 +77,6 @@ export function useDiffComments(
   getCommentApiUrl: CommentApiUrlBuilder | null,
 ): UseDiffCommentsReturn {
   const [threads, setThreads] = useState<DiffCommentThread[]>([]);
-  const [hasLoadedComments, setHasLoadedComments] = useState(false);
   // Latest server version; echoed as baseVersion for whole-list replacements.
   const versionRef = useRef<number | null>(null);
   // Guards against a slow response for a previous selection overwriting the current one.
@@ -109,14 +107,12 @@ export function useDiffComments(
       versionRef.current = version;
     }
     setThreads(Array.isArray(payload.threads) ? payload.threads : []);
-    setHasLoadedComments(true);
   }, [sessionUrl]);
 
   useEffect(() => {
     loadSequenceRef.current += 1;
     versionRef.current = null;
     setThreads([]);
-    setHasLoadedComments(false);
 
     if (!sessionUrl) {
       return;
@@ -343,7 +339,6 @@ export function useDiffComments(
   );
 
   return {
-    hasLoadedComments,
     threads,
     refreshThreads,
     addThread,

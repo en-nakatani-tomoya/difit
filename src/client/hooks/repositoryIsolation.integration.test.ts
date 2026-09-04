@@ -122,8 +122,8 @@ describe('Repository Isolation Integration Tests', () => {
       const { result: result1 } = renderHook(() => useDiffComments(repo1));
       const { result: result2 } = renderHook(() => useDiffComments(repo2));
 
-      await waitFor(() => expect(result1.current.hasLoadedComments).toBe(true));
-      await waitFor(() => expect(result2.current.hasLoadedComments).toBe(true));
+      await waitFor(() => expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(2));
+      await act(async () => {});
 
       act(() => {
         result1.current.addThread({
@@ -181,8 +181,8 @@ describe('Repository Isolation Integration Tests', () => {
       const { result: result1 } = renderHook(() => useDiffComments(scopedUrl('repo-1')));
       const { result: result2 } = renderHook(() => useDiffComments(scopedUrl('repo-2')));
 
-      await waitFor(() => expect(result1.current.hasLoadedComments).toBe(true));
-      await waitFor(() => expect(result2.current.hasLoadedComments).toBe(true));
+      await waitFor(() => expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(2));
+      await act(async () => {});
 
       expect(result1.current.threads).toHaveLength(1);
       expect(result2.current.threads).toHaveLength(0);

@@ -123,7 +123,9 @@ describe('useDiffComments', () => {
       initialProps: { getUrl: builder },
     });
     if (builder) {
-      await waitFor(() => expect(rendered.result.current.hasLoadedComments).toBe(true));
+      await waitFor(() => expect(server.requests.length).toBeGreaterThan(0));
+      // Let the resolved response land in state before callers assert on it.
+      await act(async () => {});
     }
     return rendered;
   };
@@ -151,7 +153,6 @@ describe('useDiffComments', () => {
       const { result } = renderHook(() => useDiffComments(null));
 
       expect(result.current.threads).toEqual([]);
-      expect(result.current.hasLoadedComments).toBe(false);
       expect(server.requests).toHaveLength(0);
     });
 
@@ -164,7 +165,8 @@ describe('useDiffComments', () => {
       const otherUrl = (path: string) => `${path}?base=111&target=222`;
       rerender({ getUrl: otherUrl });
 
-      await waitFor(() => expect(result.current.hasLoadedComments).toBe(true));
+      await waitFor(() => expect(server.requests).toHaveLength(2));
+      await act(async () => {});
       expect(result.current.threads).toEqual([]);
       expect(server.requests.map((request) => request.url)).toEqual([
         '/api/comments-json?base=abc1234&target=def5678',
@@ -173,16 +175,16 @@ describe('useDiffComments', () => {
     });
 
     it('does not reload when the builder identity changes but the URL does not', async () => {
-      const { result, rerender } = renderHook(({ getUrl }) => useDiffComments(getUrl), {
+      const { rerender } = renderHook(({ getUrl }) => useDiffComments(getUrl), {
         initialProps: { getUrl: (path: string) => apiUrl(path) },
       });
-      await waitFor(() => expect(result.current.hasLoadedComments).toBe(true));
+      await waitFor(() => expect(server.requests).toHaveLength(1));
 
       // A new function each render (as an un-memoized caller would pass).
       rerender({ getUrl: (path: string) => apiUrl(path) });
       rerender({ getUrl: (path: string) => apiUrl(path) });
+      await act(async () => {});
 
-      expect(result.current.hasLoadedComments).toBe(true);
       expect(server.requests).toHaveLength(1);
     });
 

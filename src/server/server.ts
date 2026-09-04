@@ -35,7 +35,7 @@ import {
   CommentStore,
   createCommentStoreKeyForSelection,
   encodeCommentStoreComponent,
-  resolveCommentStoreRoot,
+  resolveCommentStoreLocation,
 } from './comment-store.js';
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
@@ -166,7 +166,9 @@ export async function startServer(
   const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
   const initialSelection = options.selection ?? createDiffSelection('', '');
-  const commentStore = new CommentStore(resolveCommentStoreRoot(repositoryPath), repositoryId);
+  // Persisted comments are keyed by the git common dir (see comment-store.ts), not by
+  // `repositoryId`, so worktrees and subdirectory launches restore the same sessions.
+  const commentStore = new CommentStore(resolveCommentStoreLocation(repositoryPath));
   const parser = new GitDiffParser(repositoryPath);
   const fileWatcher = new FileWatcherService();
   const generatedStatusCache = new Map<

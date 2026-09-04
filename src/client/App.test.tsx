@@ -21,7 +21,6 @@ vi.mock('./hooks/useViewport', () => ({
 // Mock the useDiffComments hook
 vi.mock('./hooks/useDiffComments', () => ({
   useDiffComments: vi.fn(() => ({
-    hasLoadedComments: true,
     threads: mockComments,
     refreshThreads: mockRefreshThreads,
     addThread: vi.fn(),
