@@ -13,7 +13,6 @@ import { DiffMode } from '../types/watch.js';
 import { formatCommentsOutput } from '../utils/commentFormatting.js';
 import {
   mergeCommentImports,
-  mergeCommentThreads,
   normalizeCommentImports,
   serializeCommentImports,
 } from '../utils/commentImports.js';
@@ -32,6 +31,12 @@ import {
   normalizeDiffTitle,
 } from '../utils/diffEntries.js';
 
+import {
+  CommentStore,
+  createCommentStoreKeyForSelection,
+  encodeCommentStoreComponent,
+  resolveCommentStoreLocation,
+} from './comment-store.js';
 import { FileWatcherService } from './file-watcher.js';
 import { GitDiffParser } from './git-diff.js';
 import { parseUserSettingsPatch, readUserConfig, updateUserClientSettings } from './user-config.js';
@@ -49,11 +54,7 @@ import {
   type GeneratedStatusResponse,
   type RevisionsResponse,
 } from '@/types/diff.js';
-import {
-  createDiffSelection,
-  diffSelectionsEqual,
-  getDiffSelectionKey,
-} from '../utils/diffSelection.js';
+import { createDiffSelection, getDiffSelectionKey } from '../utils/diffSelection.js';
 
 interface ServerOptions {
   selection?: DiffSelection;
@@ -69,6 +70,11 @@ interface ServerOptions {
   repoPath?: string;
   contextLines?: number;
   title?: string;
+  /**
+   * Overrides the persistent comment store key of the initial stdin diff. `--pr` passes
+   * the PR URL so comments follow the pull request instead of the exact patch text.
+   */
+  commentStoreKey?: string;
 }
 
 const GENERATED_STATUS_CACHE_TTL_MS = 60_000;
@@ -110,7 +116,10 @@ function setCachedDiffResponse(cache: Map<string, DiffResponse>, key: string, va
 
 interface CommentSessionState {
   threads: DiffCommentThread[];
+  /** In-process change counter; clients echo it back so conflicting writes are detectable. */
   version: number;
+  /** File name (without extension) inside the repository's comment store. */
+  storeKey: string;
 }
 
 /**
@@ -125,11 +134,10 @@ interface DiffEntryState {
   /** Selection currently displayed for this entry; updated by `/api/diff`. */
   selection: DiffSelection;
   commentSelection: DiffSelection;
-  initialSelection: DiffSelection;
   stdinDiff?: string;
   stdinDiffData?: DiffResponse;
-  commentImports: CommentImport[];
-  commentImportId?: string;
+  /** Store key used for the stdin session, which has no meaningful (base, target). */
+  stdinCommentStoreKey?: string;
 }
 
 function createResolvedCommentSelection(
@@ -158,10 +166,9 @@ export async function startServer(
   const repositoryId = createHash('sha256').update(repositoryPath).digest('hex');
   const initialCommentImports = options.commentImports || [];
   const initialSelection = options.selection ?? createDiffSelection('', '');
-  const commentImportId =
-    initialCommentImports.length > 0
-      ? createHash('sha256').update(serializeCommentImports(initialCommentImports)).digest('hex')
-      : undefined;
+  // Persisted comments are keyed by the git common dir (see comment-store.ts), not by
+  // `repositoryId`, so worktrees and subdirectory launches restore the same sessions.
+  const commentStore = new CommentStore(resolveCommentStoreLocation(repositoryPath));
   const parser = new GitDiffParser(repositoryPath);
   const fileWatcher = new FileWatcherService();
   const generatedStatusCache = new Map<
@@ -237,8 +244,7 @@ export async function startServer(
     diffData: DiffResponse;
     title?: string;
     stdinDiff?: string;
-    commentImports?: CommentImport[];
-    commentImportId?: string;
+    commentStoreKey?: string;
   }): DiffEntryState {
     const id = uniqueDiffEntryId();
     const entry: DiffEntryState = {
@@ -253,11 +259,13 @@ export async function startServer(
         input.selection,
         Boolean(input.stdinDiff),
       ),
-      initialSelection: input.selection,
       stdinDiff: input.stdinDiff,
       stdinDiffData: input.stdinDiff ? input.diffData : undefined,
-      commentImports: input.commentImports ?? [],
-      commentImportId: input.commentImportId,
+      stdinCommentStoreKey: input.stdinDiff
+        ? input.commentStoreKey
+          ? encodeCommentStoreComponent(input.commentStoreKey)
+          : `stdin_${createHash('sha256').update(input.stdinDiff).digest('hex').slice(0, 16)}`
+        : undefined,
     };
     diffEntries.set(id, entry);
     activeDiffId = id;
@@ -280,8 +288,7 @@ export async function startServer(
     diffData: initialDiffData,
     title: options.title,
     stdinDiff: options.stdinDiff,
-    commentImports: initialCommentImports,
-    commentImportId,
+    commentStoreKey: options.commentStoreKey,
   });
 
   const DIFF_SCOPE_KEY = '__difitDiffEntry';
@@ -384,12 +391,15 @@ export async function startServer(
   }
 
   const commentSessions = new Map<string, CommentSessionState>();
-  const initialCommentThreads = mergeCommentImports([], initialCommentImports).threads;
-  if (initialCommentThreads.length > 0) {
-    commentSessions.set(createCommentSessionKey(initialEntry.id, initialEntry.commentSelection), {
-      threads: initialCommentThreads,
-      version: 1,
-    });
+
+  function createCommentStoreKey(entry: DiffEntryState, selection: DiffSelection): string {
+    if (
+      entry.stdinCommentStoreKey &&
+      getDiffSelectionKey(selection) === getDiffSelectionKey(entry.commentSelection)
+    ) {
+      return entry.stdinCommentStoreKey;
+    }
+    return createCommentStoreKeyForSelection(selection);
   }
 
   function getCommentSelectionFromQuery(
@@ -425,12 +435,36 @@ export async function startServer(
       return existing;
     }
 
+    // First touch of a session in this process: restore whatever an earlier process saved.
+    const storeKey = createCommentStoreKey(entry, selection);
     const nextSession: CommentSessionState = {
-      threads: [],
+      threads: commentStore.read(storeKey)?.threads ?? [],
       version: 0,
+      storeKey,
     };
     commentSessions.set(key, nextSession);
     return nextSession;
+  }
+
+  // The server is the source of truth for comments: `--clean` wipes the persisted session
+  // and `--comment` imports are merged in before any client can observe the session.
+  {
+    const startupSelection = initialEntry.commentSelection;
+    if (options.clearComments) {
+      commentStore.remove(createCommentStoreKey(initialEntry, startupSelection));
+    }
+    const startupSession = getOrCreateCommentSession(initialEntry, startupSelection);
+    if (initialCommentImports.length > 0) {
+      const merged = mergeCommentImports(startupSession.threads, initialCommentImports);
+      for (const warning of merged.warnings) {
+        console.warn(`⚠️  ${warning}`);
+      }
+      if (JSON.stringify(merged.threads) !== JSON.stringify(startupSession.threads)) {
+        startupSession.threads = merged.threads;
+        startupSession.version += 1;
+        commentStore.write(startupSession.storeKey, startupSelection, startupSession.threads);
+      }
+    }
   }
 
   let watchMode: DiffMode | undefined;
@@ -545,10 +579,6 @@ export async function startServer(
           ? undefined
           : entry.selection.baseMode,
     );
-    const shouldIncludeCommentImports =
-      entry.commentImports.length > 0 &&
-      (Boolean(entry.stdinDiff) || diffSelectionsEqual(requestedSelection, entry.initialSelection));
-
     let responseDiffData = entry.stdinDiffData ?? initialDiffData;
     if (!entry.stdinDiff) {
       const cacheKey = createDiffCacheKey(requestedSelection, ignoreWhitespace);
@@ -605,8 +635,6 @@ export async function startServer(
       requestedBaseMode,
       clearComments: options.clearComments,
       repositoryId,
-      commentImports: shouldIncludeCommentImports ? entry.commentImports : undefined,
-      commentImportId: shouldIncludeCommentImports ? entry.commentImportId : undefined,
     });
   });
 
@@ -937,7 +965,7 @@ export async function startServer(
     return [];
   }
 
-  // Version the client based its push on (omitted by older clients).
+  // Version the client based its full-replace push on.
   function parseBaseVersion(payload: unknown): number | undefined {
     if (!payload || typeof payload !== 'object') return undefined;
     const value = (payload as { baseVersion?: unknown }).baseVersion;
@@ -967,6 +995,7 @@ export async function startServer(
     }
 
     session.version += 1;
+    commentStore.write(session.storeKey, selection, session.threads);
     fileWatcher.broadcast({
       type: 'commentsChanged',
       version: session.version,
@@ -975,35 +1004,92 @@ export async function startServer(
     return true;
   }
 
+  /**
+   * Full replacement of a session, guarded by compare-and-set on `baseVersion`. Clients that
+   * want to change one thread should use PUT/DELETE `/api/comments/:threadId` instead; this
+   * endpoint exists for whole-list operations such as "clear all".
+   */
   app.post('/api/comments', (req, res) => {
+    let body: unknown;
+    let nextThreads: DiffCommentThread[];
     try {
-      const entry = resolveDiffEntry(req);
-      const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
-      const body: unknown =
-        typeof req.body === 'string' ? (JSON.parse(req.body) as unknown) : req.body;
-      const nextThreads = parseCommentsPayload(body);
-      const baseVersion = parseBaseVersion(body);
-      const session = getOrCreateCommentSession(entry, selection);
-
-      // Stale baseVersion means another writer (e.g. an agent) changed comments since the
-      // client's last read, so merge rather than overwrite. A matching/absent version replaces.
-      const isStale = typeof baseVersion === 'number' && baseVersion !== session.version;
-      const resolvedThreads = isStale
-        ? mergeCommentThreads(session.threads, nextThreads).threads
-        : nextThreads;
-
-      updateCommentSession(entry, selection, resolvedThreads);
-
-      res.json({
-        success: true,
-        merged: isStale,
-        version: session.version,
-        threads: session.threads,
-      });
+      body = typeof req.body === 'string' ? (JSON.parse(req.body) as unknown) : req.body;
+      nextThreads = parseCommentsPayload(body);
     } catch (error) {
       console.error('Error parsing comments:', error);
       res.status(400).json({ error: 'Invalid comment data' });
+      return;
     }
+
+    const baseVersion = parseBaseVersion(body);
+    if (baseVersion === undefined) {
+      res.status(400).json({
+        error:
+          'baseVersion is required: read it from GET /api/comments-json and echo it back so a stale client cannot overwrite newer comments',
+      });
+      return;
+    }
+
+    const entry = resolveDiffEntry(req);
+    const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
+    const session = getOrCreateCommentSession(entry, selection);
+
+    if (baseVersion !== session.version) {
+      // Someone else (another tab, an agent, the startup import) wrote since this client last
+      // read. Refuse rather than merge: a merge cannot express deletions and would resurrect
+      // threads the other writer removed. The client re-reads and retries.
+      res.status(409).json({
+        error: 'Comment session changed since baseVersion; reload and retry',
+        version: session.version,
+        threads: session.threads,
+      });
+      return;
+    }
+
+    updateCommentSession(entry, selection, nextThreads);
+
+    res.json({
+      success: true,
+      version: session.version,
+      threads: session.threads,
+    });
+  });
+
+  /** Creates or replaces a single thread; the unit of change the browser client uses. */
+  app.put('/api/comments/:threadId', (req, res) => {
+    const threadId = req.params.threadId;
+    let thread: DiffCommentThread;
+    try {
+      const body: unknown =
+        typeof req.body === 'string' ? (JSON.parse(req.body) as unknown) : req.body;
+      const payload = (body ?? {}) as { thread?: unknown };
+      const candidate = (payload.thread ?? body) as CommentThread | DiffCommentThread | null;
+      if (!candidate || typeof candidate !== 'object' || !Array.isArray(candidate.messages)) {
+        throw new Error('thread payload must include messages');
+      }
+      thread = normalizeThreadPayload({ ...candidate, id: threadId });
+    } catch (error) {
+      console.error('Error parsing comment thread:', error);
+      res.status(400).json({ error: 'Invalid comment thread data' });
+      return;
+    }
+
+    const entry = resolveDiffEntry(req);
+    const selection = getCommentSelectionFromQuery(entry, req.query as Record<string, unknown>);
+    const session = getOrCreateCommentSession(entry, selection);
+    const existingIndex = session.threads.findIndex((item) => item.id === threadId);
+    const nextThreads =
+      existingIndex < 0
+        ? [...session.threads, thread]
+        : session.threads.map((item, index) => (index === existingIndex ? thread : item));
+
+    updateCommentSession(entry, selection, nextThreads);
+
+    res.status(existingIndex < 0 ? 201 : 200).json({
+      success: true,
+      version: session.version,
+      thread,
+    });
   });
 
   app.post('/api/comment-imports', (req, res) => {

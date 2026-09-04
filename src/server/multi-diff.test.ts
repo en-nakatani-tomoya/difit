@@ -1,9 +1,14 @@
+import { mkdtempSync, rmSync } from 'fs';
 import { type Server } from 'http';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Set environment variable to skip fetch mocking
 process.env.VITEST_SERVER_TEST = 'true';
+// Keep persisted comment sessions out of the real repository's .git directory.
+process.env.DIFIT_COMMENT_STORE_DIR = mkdtempSync(join(tmpdir(), 'difit-multi-diff-comments-'));
 
 import { startServer } from './server.js';
 import { createDiffSelection } from '../utils/diffSelection.js';
@@ -71,6 +76,7 @@ afterEach(async () => {
     runningServer = undefined;
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+  rmSync(process.env.DIFIT_COMMENT_STORE_DIR!, { recursive: true, force: true });
 });
 
 describe('diff registry', () => {
@@ -201,6 +207,7 @@ describe('comment isolation', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          baseVersion: 0,
           comments: [{ id: '1', file: 'a.ts', line: 1, body, timestamp: '2026-09-01T00:00:00Z' }],
         }),
       });
@@ -233,6 +240,7 @@ describe('comment isolation', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          baseVersion: 0,
           comments: [{ id: '1', file: 'a.ts', line: 1, body, timestamp: '2026-09-01T00:00:00Z' }],
         }),
       });
@@ -253,6 +261,7 @@ describe('comment isolation', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        baseVersion: 0,
         comments: [
           { id: '1', file: 'a.ts', line: 1, body: 'lonely', timestamp: '2026-09-01T00:00:00Z' },
         ],

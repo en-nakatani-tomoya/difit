@@ -1,4 +1,4 @@
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import { useDiffComments } from './useDiffComments';
@@ -10,22 +10,6 @@ const mockStorage = new Map<string, any>();
 vi.mock('../services/StorageService', () => ({
   VIEWED_HASH_VERSION: 1,
   storageService: {
-    getCommentThreads: vi.fn((base, target, _hash, _branch, repoId) => {
-      const key = `${repoId || 'default'}-${base}-${target}-threads`;
-      return mockStorage.get(key) || [];
-    }),
-    saveCommentThreads: vi.fn((base, target, threads, _hash, _branch, repoId) => {
-      const key = `${repoId || 'default'}-${base}-${target}-threads`;
-      mockStorage.set(key, threads);
-    }),
-    getComments: vi.fn((base, target, _hash, _branch, repoId) => {
-      const key = `${repoId || 'default'}-${base}-${target}-comments`;
-      return mockStorage.get(key) || [];
-    }),
-    saveComments: vi.fn((base, target, comments, _hash, _branch, repoId) => {
-      const key = `${repoId || 'default'}-${base}-${target}-comments`;
-      mockStorage.set(key, comments);
-    }),
     getViewedFiles: vi.fn((base, target, _hash, _branch, repoId) => {
       const key = `${repoId || 'default'}-${base}-${target}-viewed`;
       return mockStorage.get(key) || [];
@@ -96,20 +80,53 @@ describe('Repository Isolation Integration Tests', () => {
   });
 
   describe('useDiffComments - Repository Isolation', () => {
-    it('should isolate comments between different repositories', () => {
-      // Render hook for repository 1
-      const { result: result1 } = renderHook(() =>
-        useDiffComments('base', 'target', undefined, undefined, 'repo-1'),
-      );
+    // Comments are owned by the server, one session per diff. Isolation therefore comes
+    // from each hook talking to its own diff-scoped URL rather than from a storage key.
+    const serverThreads = new Map<string, unknown[]>();
 
-      // Render hook for repository 2
-      const { result: result2 } = renderHook(() =>
-        useDiffComments('base', 'target', undefined, undefined, 'repo-2'),
-      );
+    const installServerMock = () => {
+      vi.mocked(global.fetch).mockImplementation(async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const [path, query = ''] = url.split('?');
+        const scope = new URLSearchParams(query).get('diffId') ?? 'default';
 
-      // Add comment in repository 1
+        if (path === '/api/comments-json') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ version: 0, threads: serverThreads.get(scope) ?? [] }),
+          } as Response;
+        }
+
+        if (method === 'PUT') {
+          const { thread } = JSON.parse(String(init?.body)) as { thread: { id: string } };
+          serverThreads.set(scope, [...(serverThreads.get(scope) ?? []), thread]);
+          return { ok: true, status: 201, json: async () => ({ version: 1, thread }) } as Response;
+        }
+
+        return { ok: false, status: 404, json: async () => ({}) } as Response;
+      });
+    };
+
+    const scopedUrl = (diffId: string) => (path: string) => `${path}?diffId=${diffId}`;
+
+    beforeEach(() => {
+      serverThreads.clear();
+      installServerMock();
+    });
+
+    it('should isolate comments between different repositories', async () => {
+      const repo1 = scopedUrl('repo-1');
+      const repo2 = scopedUrl('repo-2');
+      const { result: result1 } = renderHook(() => useDiffComments(repo1));
+      const { result: result2 } = renderHook(() => useDiffComments(repo2));
+
+      await waitFor(() => expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(2));
+      await act(async () => {});
+
       act(() => {
-        result1.current.addComment({
+        result1.current.addThread({
           filePath: 'test.ts',
           body: 'Comment in repo 1',
           side: 'new',
@@ -117,16 +134,12 @@ describe('Repository Isolation Integration Tests', () => {
         });
       });
 
-      // Repository 1 should have 1 comment
-      expect(result1.current.comments.length).toBe(1);
-      expect(result1.current.comments[0]?.body).toBe('Comment in repo 1');
+      expect(result1.current.threads).toHaveLength(1);
+      expect(result1.current.threads[0]?.messages[0]?.body).toBe('Comment in repo 1');
+      expect(result2.current.threads).toHaveLength(0);
 
-      // Repository 2 should have 0 comments
-      expect(result2.current.comments.length).toBe(0);
-
-      // Add comment in repository 2
       act(() => {
-        result2.current.addComment({
+        result2.current.addThread({
           filePath: 'test.ts',
           body: 'Comment in repo 2',
           side: 'new',
@@ -134,40 +147,45 @@ describe('Repository Isolation Integration Tests', () => {
         });
       });
 
-      // Repository 1 should still have only its own comment
-      expect(result1.current.comments.length).toBe(1);
-      expect(result1.current.comments[0]?.body).toBe('Comment in repo 1');
+      expect(result1.current.threads).toHaveLength(1);
+      expect(result1.current.threads[0]?.messages[0]?.body).toBe('Comment in repo 1');
+      expect(result2.current.threads).toHaveLength(1);
+      expect(result2.current.threads[0]?.messages[0]?.body).toBe('Comment in repo 2');
 
-      // Repository 2 should have only its own comment
-      expect(result2.current.comments.length).toBe(1);
-      expect(result2.current.comments[0]?.body).toBe('Comment in repo 2');
+      // Each write went to its own diff scope on the server.
+      await waitFor(() => {
+        expect(serverThreads.get('repo-1')).toHaveLength(1);
+        expect(serverThreads.get('repo-2')).toHaveLength(1);
+      });
     });
 
-    it('should isolate comments in working diff mode across repositories', () => {
-      // Repository 1 - working diff
-      const { result: result1 } = renderHook(() =>
-        useDiffComments('HEAD', 'working', 'abc123', undefined, 'repo-1'),
-      );
-
-      // Repository 2 - working diff with same commit
-      const { result: result2 } = renderHook(() =>
-        useDiffComments('HEAD', 'working', 'abc123', undefined, 'repo-2'),
-      );
-
-      act(() => {
-        result1.current.addComment({
+    it('should only show the server session of its own repository after reload', async () => {
+      serverThreads.set('repo-1', [
+        {
+          id: 'remote-1',
           filePath: 'file.ts',
-          body: 'Working diff comment in repo 1',
-          side: 'new',
-          line: 5,
-        });
-      });
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z',
+          position: { side: 'new', line: 5 },
+          messages: [
+            {
+              id: 'remote-1',
+              body: 'Working diff comment in repo 1',
+              createdAt: '2024-01-01T00:00:00Z',
+              updatedAt: '2024-01-01T00:00:00Z',
+            },
+          ],
+        },
+      ]);
 
-      // Repo 1 should have the comment
-      expect(result1.current.comments.length).toBe(1);
+      const { result: result1 } = renderHook(() => useDiffComments(scopedUrl('repo-1')));
+      const { result: result2 } = renderHook(() => useDiffComments(scopedUrl('repo-2')));
 
-      // Repo 2 should NOT see the comment
-      expect(result2.current.comments.length).toBe(0);
+      await waitFor(() => expect(vi.mocked(global.fetch)).toHaveBeenCalledTimes(2));
+      await act(async () => {});
+
+      expect(result1.current.threads).toHaveLength(1);
+      expect(result2.current.threads).toHaveLength(0);
     });
   });
 

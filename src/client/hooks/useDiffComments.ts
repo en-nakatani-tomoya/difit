@@ -1,22 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
-import {
-  type BaseMode,
-  type CommentImport,
-  type CommentThread,
-  type DiffContextStorage,
-  type DiffCommentThread,
-  type DiffSide,
-  type LegacyDiffComment,
-} from '../../types/diff';
+import { type CommentThread, type DiffCommentThread, type DiffSide } from '../../types/diff';
 import {
   type CommentPromptDiffContext,
   formatCommentThreadPrompt,
   formatAllCommentThreadsPrompt,
 } from '../../utils/commentFormatting';
 import { createId } from '../../utils/createId';
-import { mergeCommentImports } from '../../utils/commentImports';
-import { storageService } from '../services/StorageService';
 import { getLanguageFromPath } from '../utils/diffUtils';
 
 interface AddThreadParams {
@@ -32,22 +22,19 @@ interface ReplyToThreadParams {
   body: string;
 }
 
+/** Builds the URL of a comment API path for the current diff selection. */
+export type CommentApiUrlBuilder = (path: string) => string;
+
 interface UseDiffCommentsReturn {
-  hasLoadedComments: boolean;
-  comments: LegacyDiffComment[];
   threads: DiffCommentThread[];
-  replaceThreads: (threads: DiffCommentThread[]) => void;
-  addComment: (params: AddThreadParams) => LegacyDiffComment;
+  /** Re-reads the session from the server (used when another writer changed it). */
+  refreshThreads: () => Promise<void>;
   addThread: (params: AddThreadParams) => DiffCommentThread;
-  removeComment: (commentId: string) => void;
   replyToThread: (params: ReplyToThreadParams) => void;
   removeThread: (threadId: string) => void;
-  updateComment: (commentId: string, newBody: string) => void;
   removeMessage: (threadId: string, messageId: string) => void;
   updateMessage: (threadId: string, messageId: string, newBody: string) => void;
-  clearAllComments: (options?: { resetAppliedCommentImportIds?: boolean }) => void;
-  applyCommentImports: (imports: CommentImport[], importId: string) => string[];
-  generatePrompt: (commentId: string) => string;
+  clearAllComments: () => void;
   generateThreadPrompt: (threadId: string) => string;
   generateAllCommentsPrompt: (context?: CommentPromptDiffContext) => string;
 }
@@ -68,120 +55,147 @@ function normalizeThread(thread: DiffCommentThread): CommentThread {
   };
 }
 
-function normalizeRootComment(thread: DiffCommentThread): LegacyDiffComment | null {
-  const rootMessage = thread.messages[0];
-  if (!rootMessage) return null;
-
-  return {
-    id: thread.id,
-    filePath: thread.filePath,
-    body: rootMessage.body,
-    author: rootMessage.author,
-    createdAt: rootMessage.createdAt,
-    updatedAt: rootMessage.updatedAt,
-    position: thread.position,
-    codeSnapshot: thread.codeSnapshot,
-  };
+interface CommentsJsonPayload {
+  version?: number;
+  threads?: DiffCommentThread[];
 }
 
+function readVersion(payload: unknown): number | undefined {
+  const version = (payload as { version?: unknown } | null)?.version;
+  return typeof version === 'number' ? version : undefined;
+}
+
+/**
+ * Review comments for one diff selection. The server session is the source of truth:
+ * this hook reads it, applies user edits optimistically, and sends each edit as a
+ * per-thread PUT/DELETE so concurrent writers (other tabs, agents) never clobber each other.
+ *
+ * `getCommentApiUrl` is `null` until the diff selection is known. The URL it produces for
+ * `/api/comments-json` is the session key: when it changes, the hook reloads.
+ */
 export function useDiffComments(
-  baseCommitish?: string,
-  targetCommitish?: string,
-  currentCommitHash?: string,
-  branchToHash?: Map<string, string>,
-  repositoryId?: string,
-  baseMode?: BaseMode,
+  getCommentApiUrl: CommentApiUrlBuilder | null,
 ): UseDiffCommentsReturn {
   const [threads, setThreads] = useState<DiffCommentThread[]>([]);
-  const [hasLoadedComments, setHasLoadedComments] = useState(false);
+  // Latest server version; echoed as baseVersion for whole-list replacements.
+  const versionRef = useRef<number | null>(null);
+  // Guards against a slow response for a previous selection overwriting the current one.
+  const loadSequenceRef = useRef(0);
+  // Keyed by the resulting URL rather than the builder's identity so an un-memoized builder
+  // cannot trigger a reload on every render.
+  const sessionUrl = getCommentApiUrl ? getCommentApiUrl('/api/comments-json') : null;
+  const builderRef = useRef(getCommentApiUrl);
+  builderRef.current = getCommentApiUrl;
 
-  const loadDiffContextData = useCallback(() => {
-    if (!baseCommitish || !targetCommitish) {
-      return null;
-    }
-
-    return storageService.getDiffContextData(
-      baseCommitish,
-      targetCommitish,
-      currentCommitHash,
-      branchToHash,
-      repositoryId,
-      baseMode,
-    );
-  }, [baseCommitish, targetCommitish, currentCommitHash, branchToHash, repositoryId, baseMode]);
-
-  const createEmptyDiffContext = useCallback((): DiffContextStorage | null => {
-    if (!baseCommitish || !targetCommitish) {
-      return null;
-    }
-
-    const now = new Date().toISOString();
-    return {
-      version: 2,
-      baseCommitish,
-      targetCommitish,
-      baseMode,
-      createdAt: now,
-      lastModifiedAt: now,
-      threads: [],
-      viewedFiles: [],
-      appliedCommentImportIds: [],
-    };
-  }, [baseCommitish, targetCommitish, baseMode]);
-
-  useEffect(() => {
-    if (!baseCommitish || !targetCommitish) {
-      setThreads([]);
-      setHasLoadedComments(false);
+  const refreshThreads = useCallback(async () => {
+    if (!sessionUrl) {
       return;
     }
 
-    const loadedThreads =
-      loadDiffContextData()?.threads ||
-      storageService.getCommentThreads(
-        baseCommitish,
-        targetCommitish,
-        currentCommitHash,
-        branchToHash,
-        repositoryId,
-        baseMode,
-      );
-    setThreads(loadedThreads);
-    setHasLoadedComments(true);
-  }, [
-    baseCommitish,
-    targetCommitish,
-    currentCommitHash,
-    branchToHash,
-    repositoryId,
-    baseMode,
-    loadDiffContextData,
-  ]);
+    const sequence = ++loadSequenceRef.current;
+    const response = await fetch(sessionUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch comments: ${response.status} ${response.statusText}`);
+    }
 
-  const saveThreads = useCallback(
-    (newThreads: DiffCommentThread[]) => {
-      if (!baseCommitish || !targetCommitish) return;
+    const payload = (await response.json()) as CommentsJsonPayload;
+    if (sequence !== loadSequenceRef.current) {
+      return;
+    }
+    const version = readVersion(payload);
+    if (version !== undefined) {
+      versionRef.current = version;
+    }
+    setThreads(Array.isArray(payload.threads) ? payload.threads : []);
+  }, [sessionUrl]);
 
-      storageService.saveCommentThreads(
-        baseCommitish,
-        targetCommitish,
-        newThreads,
-        currentCommitHash,
-        branchToHash,
-        repositoryId,
-        baseMode,
-      );
-      setThreads(newThreads);
-      setHasLoadedComments(true);
+  useEffect(() => {
+    loadSequenceRef.current += 1;
+    versionRef.current = null;
+    setThreads([]);
+
+    if (!sessionUrl) {
+      return;
+    }
+
+    refreshThreads().catch((error: unknown) => {
+      console.error('Failed to load comments from server:', error);
+    });
+  }, [sessionUrl, refreshThreads]);
+
+  const recoverFromFailedWrite = useCallback(
+    (error: unknown) => {
+      console.error('Failed to save comment to server:', error);
+      refreshThreads().catch((refreshError: unknown) => {
+        console.error('Failed to reload comments after a failed save:', refreshError);
+      });
     },
-    [baseCommitish, targetCommitish, currentCommitHash, branchToHash, repositoryId, baseMode],
+    [refreshThreads],
   );
 
-  const replaceThreads = useCallback(
-    (newThreads: DiffCommentThread[]) => {
-      saveThreads(newThreads);
+  const adoptVersion = useCallback((payload: unknown) => {
+    const version = readVersion(payload);
+    if (version !== undefined) {
+      versionRef.current = version;
+    }
+  }, []);
+
+  /** Optimistically upserts a thread locally, then persists it with PUT. */
+  const commitThread = useCallback(
+    (thread: DiffCommentThread) => {
+      setThreads((current) => {
+        const index = current.findIndex((item) => item.id === thread.id);
+        return index < 0
+          ? [...current, thread]
+          : current.map((item, itemIndex) => (itemIndex === index ? thread : item));
+      });
+
+      const getUrl = builderRef.current;
+      if (!getUrl) {
+        return;
+      }
+
+      fetch(getUrl(`/api/comments/${encodeURIComponent(thread.id)}`), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error(`${response.status} ${response.statusText}`);
+          }
+          adoptVersion(await response.json());
+        })
+        .catch(recoverFromFailedWrite);
     },
-    [saveThreads],
+    [adoptVersion, recoverFromFailedWrite],
+  );
+
+  const removeThread = useCallback(
+    (threadId: string) => {
+      setThreads((current) => current.filter((thread) => thread.id !== threadId));
+
+      const getUrl = builderRef.current;
+      if (!getUrl) {
+        return;
+      }
+
+      fetch(getUrl(`/api/comments/${encodeURIComponent(threadId)}`), {
+        method: 'DELETE',
+      })
+        .then(async (response) => {
+          // 404 means another writer already removed it, which is the state we wanted.
+          if (response.status === 404) {
+            return;
+          }
+          if (!response.ok) {
+            throw new Error(`${response.status} ${response.statusText}`);
+          }
+          adoptVersion(await response.json());
+        })
+        .catch(recoverFromFailedWrite);
+    },
+    [adoptVersion, recoverFromFailedWrite],
   );
 
   const addThread = useCallback(
@@ -212,64 +226,34 @@ export function useDiffComments(
         ],
       };
 
-      const newThreads = [...threads, newThread];
-      saveThreads(newThreads);
+      commitThread(newThread);
       return newThread;
     },
-    [saveThreads, threads],
-  );
-
-  const addComment = useCallback(
-    (params: AddThreadParams): LegacyDiffComment => {
-      const thread = addThread(params);
-      const rootComment = normalizeRootComment(thread);
-      if (!rootComment) {
-        throw new Error('Failed to create root comment');
-      }
-      return rootComment;
-    },
-    [addThread],
+    [commitThread],
   );
 
   const replyToThread = useCallback(
     ({ threadId, body }: ReplyToThreadParams) => {
+      const thread = threads.find((item) => item.id === threadId);
+      if (!thread) return;
+
       const now = new Date().toISOString();
-      const newThreads = threads.map((thread) =>
-        thread.id === threadId
-          ? {
-              ...thread,
-              updatedAt: now,
-              messages: [
-                ...thread.messages,
-                {
-                  id: createId(),
-                  body,
-                  author: 'User',
-                  createdAt: now,
-                  updatedAt: now,
-                },
-              ],
-            }
-          : thread,
-      );
-      saveThreads(newThreads);
+      commitThread({
+        ...thread,
+        updatedAt: now,
+        messages: [
+          ...thread.messages,
+          {
+            id: createId(),
+            body,
+            author: 'User',
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      });
     },
-    [saveThreads, threads],
-  );
-
-  const removeThread = useCallback(
-    (threadId: string) => {
-      const newThreads = threads.filter((thread) => thread.id !== threadId);
-      saveThreads(newThreads);
-    },
-    [saveThreads, threads],
-  );
-
-  const removeComment = useCallback(
-    (commentId: string) => {
-      removeThread(commentId);
-    },
-    [removeThread],
+    [commitThread, threads],
   );
 
   const removeMessage = useCallback(
@@ -287,139 +271,55 @@ export function useDiffComments(
         return;
       }
 
-      const now = new Date().toISOString();
-      const newThreads = threads.map((item) =>
-        item.id === threadId
-          ? {
-              ...item,
-              updatedAt: now,
-              messages: item.messages.filter((message) => message.id !== messageId),
-            }
-          : item,
-      );
-      saveThreads(newThreads);
+      commitThread({
+        ...thread,
+        updatedAt: new Date().toISOString(),
+        messages: thread.messages.filter((message) => message.id !== messageId),
+      });
     },
-    [removeThread, saveThreads, threads],
+    [commitThread, removeThread, threads],
   );
 
   const updateMessage = useCallback(
     (threadId: string, messageId: string, newBody: string) => {
-      const now = new Date().toISOString();
-      const newThreads = threads.map((thread) =>
-        thread.id === threadId
-          ? {
-              ...thread,
-              updatedAt: now,
-              messages: thread.messages.map((message) =>
-                message.id === messageId ? { ...message, body: newBody, updatedAt: now } : message,
-              ),
-            }
-          : thread,
-      );
-      saveThreads(newThreads);
-    },
-    [saveThreads, threads],
-  );
+      const thread = threads.find((item) => item.id === threadId);
+      if (!thread) return;
 
-  const updateComment = useCallback(
-    (commentId: string, newBody: string) => {
-      updateMessage(commentId, commentId, newBody);
+      const now = new Date().toISOString();
+      commitThread({
+        ...thread,
+        updatedAt: now,
+        messages: thread.messages.map((message) =>
+          message.id === messageId ? { ...message, body: newBody, updatedAt: now } : message,
+        ),
+      });
     },
-    [updateMessage],
+    [commitThread, threads],
   );
 
   const clearAllComments = useCallback(() => {
-    saveThreads([]);
-  }, [saveThreads]);
+    setThreads([]);
 
-  const clearAllCommentsWithOptions = useCallback(
-    (options?: { resetAppliedCommentImportIds?: boolean }) => {
-      if (!options?.resetAppliedCommentImportIds) {
-        clearAllComments();
-        return;
-      }
+    const getUrl = builderRef.current;
+    if (!getUrl) {
+      return;
+    }
 
-      const existingData = loadDiffContextData() || createEmptyDiffContext();
-      if (!existingData || !baseCommitish || !targetCommitish) {
-        return;
-      }
-
-      const nextData: DiffContextStorage = {
-        ...existingData,
-        threads: [],
-        appliedCommentImportIds: [],
-      };
-
-      storageService.saveDiffContextData(
-        baseCommitish,
-        targetCommitish,
-        nextData,
-        currentCommitHash,
-        branchToHash,
-        repositoryId,
-        baseMode,
-      );
-      setThreads([]);
-    },
-    [
-      baseCommitish,
-      targetCommitish,
-      branchToHash,
-      clearAllComments,
-      createEmptyDiffContext,
-      currentCommitHash,
-      loadDiffContextData,
-      repositoryId,
-      baseMode,
-    ],
-  );
-
-  const applyCommentImports = useCallback(
-    (imports: CommentImport[], importId: string): string[] => {
-      if (!baseCommitish || !targetCommitish || imports.length === 0 || importId.length === 0) {
-        return [];
-      }
-
-      const existingData = loadDiffContextData() || createEmptyDiffContext();
-      if (!existingData) {
-        return [];
-      }
-
-      if (existingData.appliedCommentImportIds.includes(importId)) {
-        setThreads(existingData.threads);
-        return [];
-      }
-
-      const merged = mergeCommentImports(existingData.threads, imports);
-      const nextData: DiffContextStorage = {
-        ...existingData,
-        threads: merged.threads,
-        appliedCommentImportIds: [...existingData.appliedCommentImportIds, importId],
-      };
-
-      storageService.saveDiffContextData(
-        baseCommitish,
-        targetCommitish,
-        nextData,
-        currentCommitHash,
-        branchToHash,
-        repositoryId,
-        baseMode,
-      );
-      setThreads(merged.threads);
-      return merged.warnings;
-    },
-    [
-      baseCommitish,
-      targetCommitish,
-      branchToHash,
-      createEmptyDiffContext,
-      currentCommitHash,
-      loadDiffContextData,
-      repositoryId,
-      baseMode,
-    ],
-  );
+    // Whole-list replacement is compare-and-set on the version we last saw; a 409 means
+    // another writer got in between, and the recovery path reloads their state.
+    fetch(getUrl('/api/comments'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threads: [], baseVersion: versionRef.current ?? 0 }),
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`${response.status} ${response.statusText}`);
+        }
+        adoptVersion(await response.json());
+      })
+      .catch(recoverFromFailedWrite);
+  }, [adoptVersion, recoverFromFailedWrite]);
 
   const generateThreadPrompt = useCallback(
     (threadId: string): string => {
@@ -431,13 +331,6 @@ export function useDiffComments(
     [threads],
   );
 
-  const generatePrompt = useCallback(
-    (commentId: string): string => {
-      return generateThreadPrompt(commentId);
-    },
-    [generateThreadPrompt],
-  );
-
   const generateAllCommentsPrompt = useCallback(
     (context?: CommentPromptDiffContext): string => {
       return formatAllCommentThreadsPrompt(threads.map(normalizeThread), context);
@@ -445,26 +338,15 @@ export function useDiffComments(
     [threads],
   );
 
-  const comments = threads
-    .map((thread) => normalizeRootComment(thread))
-    .filter((comment): comment is LegacyDiffComment => comment !== null);
-
   return {
-    hasLoadedComments,
-    comments,
     threads,
-    replaceThreads,
-    addComment,
+    refreshThreads,
     addThread,
-    removeComment,
     replyToThread,
     removeThread,
-    updateComment,
     removeMessage,
     updateMessage,
-    clearAllComments: clearAllCommentsWithOptions,
-    applyCommentImports,
-    generatePrompt,
+    clearAllComments,
     generateThreadPrompt,
     generateAllCommentsPrompt,
   };

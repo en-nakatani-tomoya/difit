@@ -215,6 +215,8 @@ program
           clearComments: options.clean,
           keepAlive: options.keepAlive,
           title: options.title ?? stdinReviewLabel,
+          // Persist PR comments under the PR URL so they survive new pushes to the PR.
+          ...(options.pr ? { commentStoreKey: `pr:${options.pr}` } : {}),
           ...(commentImports.length > 0 ? { commentImports } : {}),
         });
 
